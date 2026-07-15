@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import atexit
+import copy
 import csv
 import io
 import json
@@ -19,7 +20,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 
 THEME = {
-    "bg": "#0d0d0d",
+    "bg": "#000000",
     "fg": "#00ff41",
     "panel": "#1a1a1a",
     "accent": "#00ff41",
@@ -358,6 +359,9 @@ class AirodumpWorker(threading.Thread):
         self._last_band = None
         self._last_channel = None
         self._last_bssid = None
+        self._data_lock = threading.Lock()
+        self._latest_networks: list[dict] = []
+        self._latest_clients: list[dict] = []
 
     def _build_base_cmd(self, prefix: str) -> list[str]:
         fmt = ",".join(self.settings.get("output_formats"))
@@ -446,21 +450,34 @@ class AirodumpWorker(threading.Thread):
         self._paused.clear()
 
     def run(self):
+        """Loop A: parse airodump-ng CSV into a shared buffer as fast as possible.
+
+        The capture/channel hopping itself is handled by the airodump-ng
+        subprocess; this thread polls the CSV output and updates the shared
+        buffer every 200 ms.  Display rendering happens independently in Loop B.
+        """
         csv_path = Path(f"{self._prefix}-01.csv")
         last_mtime = 0
+        poll_interval = 0.2  # 200 ms
         while self._running.is_set():
             if not self._paused.is_set() and csv_path.exists():
-                mtime = csv_path.stat().st_mtime
-                if mtime != last_mtime:
-                    last_mtime = mtime
-                    try:
+                try:
+                    mtime = csv_path.stat().st_mtime
+                    if mtime != last_mtime:
+                        last_mtime = mtime
                         text = csv_path.read_text(encoding="utf-8", errors="ignore")
                         networks, clients = parse_airodump_csv(text)
-                        self.queue.put(("networks", networks))
-                        self.queue.put(("clients", clients))
-                    except Exception as e:
-                        self.queue.put(("error", str(e)))
-            time.sleep(1.5)
+                        with self._data_lock:
+                            self._latest_networks = networks
+                            self._latest_clients = clients
+                except Exception as e:
+                    self.queue.put(("error", str(e)))
+            time.sleep(poll_interval)
+
+    def get_latest(self) -> tuple[list[dict], list[dict]]:
+        """Return a deep copy of the most recently parsed networks and clients."""
+        with self._data_lock:
+            return copy.deepcopy(self._latest_networks), copy.deepcopy(self._latest_clients)
 
 
 class SignalGraph:
@@ -817,6 +834,7 @@ class N2NgApp:
         self.poll_id = None
         self._paused = False
 
+        self._configure_ttk_styles()
         self._build_ui()
         self._refresh_adapters()
         self._poll_queue()
@@ -828,6 +846,44 @@ class N2NgApp:
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
+    def _configure_ttk_styles(self):
+        """Apply the dark theme to ttk widgets (Treeview, Scrollbar, etc.)."""
+        style = ttk.Style(self.root)
+        # Prefer the clam theme because it reliably honors custom colors.
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure(
+            "Treeview",
+            background=THEME["bg"],
+            foreground=THEME["fg"],
+            fieldbackground=THEME["bg"],
+            rowheight=22,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=THEME["panel"],
+            foreground=THEME["fg"],
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", THEME["accent"])],
+            foreground=[("selected", THEME["bg"])],
+        )
+        style.configure(
+            "Vertical.TScrollbar",
+            background=THEME["panel"],
+            troughcolor=THEME["bg"],
+            bordercolor=THEME["bg"],
+            arrowcolor=THEME["fg"],
+        )
+        style.configure(
+            "Horizontal.TScrollbar",
+            background=THEME["panel"],
+            troughcolor=THEME["bg"],
+            bordercolor=THEME["bg"],
+            arrowcolor=THEME["fg"],
+        )
+
     def _build_ui(self):
         self._build_toolbar()
 
@@ -1284,13 +1340,25 @@ class N2NgApp:
     # Queue / network updates
     # ------------------------------------------------------------------
     def _poll_queue(self):
+        """Loop B: fixed-rate display refresh, independent of capture.
+
+        Reads the latest parsed data from the worker's shared buffer and
+        re-renders the UI at ~6.7 FPS.  One-off events (handshake/pmkid/
+        errors) are drained from the queue without blocking on capture.
+        """
+        # Always refresh display from the shared buffer.
+        if self.worker:
+            networks, clients = self.worker.get_latest()
+            self._update_networks(networks)
+            self._update_clients(clients)
+
+        # Drain asynchronous events.
         while not self.queue.empty():
-            event, payload = self.queue.get_nowait()
-            if event == "networks":
-                self._update_networks(payload)
-            elif event == "clients":
-                self._update_clients(payload)
-            elif event == "handshake":
+            try:
+                event, payload = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            if event == "handshake":
                 self._notify_capture("WPA Handshake Captured", payload["file"])
             elif event == "pmkid":
                 self._notify_capture("PMKID Captured", payload["file"])
@@ -1458,22 +1526,33 @@ class N2NgApp:
         )
 
     def _refresh_tree(self):
-        # Remember selection
+        # Refresh the tree in-place to avoid full rebuild flicker at 6-7 FPS.
         selected = set(self.tree.selection())
-        # Clear and rebuild
-        self.tree.delete(*self.tree.get_children())
         networks = list(self.networks.values())
         networks = self._filter_networks(networks)
         networks = self._sort_networks(networks)
+        wanted = {net["bssid"] for net in networks}
+
+        # Remove rows that no longer pass filter/sort.
+        for iid in list(self.tree.get_children()):
+            if iid not in wanted:
+                self.tree.delete(iid)
+
+        # Insert new or update existing rows.
         for net in networks:
             bssid = net["bssid"]
             values = self._network_values(net)
             tag = self._privacy_tag(net.get("privacy", ""))
-            self.tree.insert("", tk.END, iid=bssid, values=values, tags=(tag,))
-        # Restore selection if item still exists
+            if self.tree.exists(bssid):
+                self.tree.item(bssid, values=values, tags=(tag,))
+            else:
+                self.tree.insert("", tk.END, iid=bssid, values=values, tags=(tag,))
+
+        # Restore selection if item still exists.
         for bssid in selected:
             if self.tree.exists(bssid):
                 self.tree.selection_add(bssid)
+
         # Color config
         self.tree.tag_configure("OPN", foreground="#00ff41")
         self.tree.tag_configure("WEP", foreground="#ff4444")
