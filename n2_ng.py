@@ -153,6 +153,140 @@ class AirmonManager:
         return Path(f"/sys/class/net/{name}").exists()
 
 
+def _normalize_csv_reader(reader: csv.DictReader):
+    """Return fieldnames with surrounding whitespace stripped."""
+    if reader.fieldnames:
+        reader.fieldnames = [fn.strip() for fn in reader.fieldnames]
+    return reader
+
+
+def parse_airodump_csv(text: str):
+    networks = []
+    clients = []
+    text = text.strip()
+    if not text:
+        return networks, clients
+    sections = text.split("\n\n")
+    if not sections:
+        return networks, clients
+    # Strip leading/trailing whitespace from each line to handle indented samples
+    ap_lines = "\n".join(line.strip() for line in sections[0].splitlines())
+    reader = _normalize_csv_reader(csv.DictReader(io.StringIO(ap_lines)))
+    for row in reader:
+        bssid = format_bssid(row.get("BSSID", ""))
+        essid = row.get("ESSID", "").strip()
+        if not essid or essid.lower().startswith("<length:"):
+            essid = "[Hidden]"
+        networks.append({
+            "bssid": bssid,
+            "first": row.get("First time seen", "").strip(),
+            "last": row.get("Last time seen", "").strip(),
+            "channel": row.get("channel", "").strip(),
+            "speed": row.get("Speed", "").strip(),
+            "privacy": row.get("Privacy", "").strip(),
+            "cipher": row.get("Cipher", "").strip(),
+            "auth": row.get("Authentication", "").strip(),
+            "power": row.get("Power", "").strip(),
+            "beacons": row.get("# Beacons", "").strip(),
+            "iv": row.get("# IV", "").strip(),
+            "id_len": row.get("ID-length", "").strip(),
+            "essid": essid,
+        })
+    if len(sections) > 1:
+        client_lines = "\n".join(line.strip() for line in sections[1].splitlines())
+        reader = _normalize_csv_reader(csv.DictReader(io.StringIO(client_lines)))
+        for row in reader:
+            clients.append({
+                "station": format_bssid(row.get("Station MAC", "")),
+                "first": row.get("First time seen", "").strip(),
+                "last": row.get("Last time seen", "").strip(),
+                "power": row.get("Power", "").strip(),
+                "packets": row.get("# packets", "").strip(),
+                "bssid": format_bssid(row.get("BSSID", "")),
+                "probed": row.get("Probed ESSIDs", "").strip(),
+            })
+    return networks, clients
+
+
+class AirodumpWorker(threading.Thread):
+    """Run airodump-ng and parse its CSV output."""
+
+    def __init__(self, event_queue: queue.Queue):
+        super().__init__(daemon=True)
+        self.queue = event_queue
+        self._proc = None
+        self._prefix = "/tmp/n2ng_scan"
+        self._running = threading.Event()
+
+    def start_scan(self, mon_iface: str, band: str, prefix: str):
+        self.stop()
+        self._prefix = prefix
+        band_arg = {"2.4GHz": "bg", "5GHz": "a", "Both": "abg"}.get(band, "abg")
+        cmd = [
+            "airodump-ng",
+            "--write-interval", "1",
+            "-w", prefix,
+            "--output-format", "csv",
+            "--band", band_arg,
+            mon_iface,
+        ]
+        self._running.set()
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if not self.is_alive():
+            self.start()
+
+    def start_lock(self, mon_iface: str, channel: int, bssid: str, prefix: str):
+        self.stop()
+        self._prefix = prefix
+        cmd = [
+            "airodump-ng",
+            "-c", str(channel),
+            "--bssid", bssid,
+            "--write-interval", "1",
+            "-w", prefix,
+            "--output-format", "csv",
+            mon_iface,
+        ]
+        self._running.set()
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if not self.is_alive():
+            self.start()
+
+    def stop(self):
+        self._running.clear()
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+
+    def run(self):
+        csv_path = Path(f"{self._prefix}-01.csv")
+        last_mtime = 0
+        while self._running.is_set():
+            if csv_path.exists():
+                mtime = csv_path.stat().st_mtime
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    try:
+                        text = csv_path.read_text(encoding="utf-8", errors="ignore")
+                        networks, clients = parse_airodump_csv(text)
+                        self.queue.put(("networks", networks))
+                        self.queue.put(("clients", clients))
+                    except Exception as e:
+                        self.queue.put(("error", str(e)))
+            time.sleep(1.5)
+
+
 def ensure_root():
     if os.geteuid() == 0:
         return
