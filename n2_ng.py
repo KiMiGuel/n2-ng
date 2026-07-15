@@ -30,6 +30,96 @@ THEME = {
 }
 
 
+class AnsiParser:
+    """Minimal ANSI SGR parser for airodump-ng --color output."""
+
+    ANSI_RE = re.compile(r"\x1b\[(\d+(?:;\d+)*)m")
+
+    # Map basic ANSI foreground codes to theme colors.
+    FG_COLORS = {
+        30: "#000000",
+        31: "#ff4444",
+        32: "#00ff41",
+        33: "#ffcc00",
+        34: "#00ccff",
+        35: "#ff00ff",
+        36: "#00ccff",
+        37: "#ffffff",
+    }
+    BG_COLORS = {
+        40: "#000000",
+        41: "#ff4444",
+        42: "#00ff41",
+        43: "#ffcc00",
+        44: "#00ccff",
+        45: "#ff00ff",
+        46: "#00ccff",
+        47: "#ffffff",
+    }
+
+    def parse(self, line: str) -> tuple[str, list[tuple[str, int, int]]]:
+        """Return stripped text and list of (tag_name, start, end) tuples."""
+        plain = []
+        tags = []
+        pos = 0
+        bold = False
+        fg = None
+        bg = None
+        last_tag = None
+        tag_start = 0
+
+        for match in self.ANSI_RE.finditer(line):
+            segment = line[pos:match.start()]
+            plain.append(segment)
+            pos = match.end()
+
+            codes = [int(c) for c in match.group(1).split(";") if c.isdigit()]
+            if not codes:
+                codes = [0]
+            for code in codes:
+                if code == 0:
+                    bold = False
+                    fg = None
+                    bg = None
+                elif code == 1:
+                    bold = True
+                elif 30 <= code <= 37:
+                    fg = code
+                elif 40 <= code <= 47:
+                    bg = code
+
+            current_tag = self._tag_name(fg, bg, bold)
+            if current_tag != last_tag:
+                if last_tag is not None:
+                    tags.append((last_tag, tag_start, len("".join(plain))))
+                last_tag = current_tag
+                tag_start = len("".join(plain))
+
+        plain.append(line[pos:])
+        if last_tag is not None:
+            tags.append((last_tag, tag_start, len("".join(plain))))
+
+        return "".join(plain), tags
+
+    def _tag_name(self, fg, bg, bold):
+        parts = []
+        if fg is not None:
+            parts.append(f"fg_{fg}")
+        if bg is not None:
+            parts.append(f"bg_{bg}")
+        if bold:
+            parts.append("bold")
+        return "ansi_" + "_".join(parts) if parts else "ansi_default"
+
+    def configure_tags(self, text_widget: tk.Text):
+        """Create tk.Text tags for all supported ANSI combinations."""
+        for fg_code, color in self.FG_COLORS.items():
+            text_widget.tag_configure(f"ansi_fg_{fg_code}", foreground=color)
+        for bg_code, color in self.BG_COLORS.items():
+            text_widget.tag_configure(f"ansi_bg_{bg_code}", background=color)
+        text_widget.tag_configure("ansi_bold", font=("Courier", 10, "bold"))
+
+
 def format_bssid(bssid: str) -> str:
     return bssid.upper().strip()
 
@@ -720,6 +810,89 @@ class WpsScanner(threading.Thread):
                     pass
 
 
+class AirodumpRawView:
+    """Read-only tk.Text widget showing ANSI-colored airodump-ng output."""
+
+    MAX_LINES = 500
+
+    def __init__(self, parent):
+        self.text = tk.Text(
+            parent,
+            bg=THEME["bg"],
+            fg=THEME["fg"],
+            font=("Consolas", 10),
+            wrap=tk.NONE,
+            state=tk.DISABLED,
+            height=20,
+        )
+        self.text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.ansi = AnsiParser()
+        self.ansi.configure_tags(self.text)
+        self.queue = queue.Queue()
+        self._proc = None
+        self._thread = None
+        self._running = threading.Event()
+
+    def start(self, cmd: list[str]):
+        self.stop()
+        self._running.set()
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def _reader(self):
+        for line in self._proc.stdout:
+            if not self._running.is_set():
+                break
+            self.queue.put(line.rstrip("\n"))
+        self._proc.wait()
+
+    def stop(self):
+        self._running.clear()
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+
+    def flush(self):
+        """Call from tkinter main thread to drain queued lines."""
+        updated = False
+        while not self.queue.empty():
+            try:
+                line = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            self._append_line(line)
+            updated = True
+        return updated
+
+    def _append_line(self, line: str):
+        self.text.config(state=tk.NORMAL)
+        plain, tags = self.ansi.parse(line)
+        self.text.insert(tk.END, plain + "\n")
+        line_start = self.text.index("end-2l linestart")
+        for tag_name, start, end in tags:
+            self.text.tag_add(tag_name, f"{line_start}+{start}c", f"{line_start}+{end}c")
+        # Trim old lines.
+        count = int(self.text.index("end-1c").split(".")[0]) - 1
+        if count > self.MAX_LINES:
+            self.text.delete("1.0", f"{count - self.MAX_LINES}.0")
+        self.text.see(tk.END)
+        self.text.config(state=tk.DISABLED)
+
+
 class SettingsDialog(tk.Toplevel):
     """Modal dialog for airodump-ng settings."""
 
@@ -935,8 +1108,8 @@ class N2NgApp:
         self._build_right_panel(self.right_inner_frame)
 
     def _build_raw_view(self, parent):
-        """Stub: replaced in Task 3 with ANSI-colored airodump-ng output."""
-        self.raw_view = None
+        """Build the Raw View tab."""
+        self.raw_view = AirodumpRawView(parent)
 
     def _build_toolbar(self):
         toolbar = tk.Frame(self.root, bg=THEME["panel"])
@@ -1117,11 +1290,31 @@ class N2NgApp:
             self.status.config(text=f"Monitor: {self.mon_iface}")
             self.pause_btn.config(text="Pause Scan")
             self.worker.start_scan(self.mon_iface, self.current_band.get(), "/tmp/n2ng_scan")
+            self._start_raw_view_scan()
         except Exception as e:
             messagebox.showerror("N2-ng", f"Failed to start monitor mode: {e}")
 
+    def _start_raw_view_scan(self):
+        if not self.mon_iface or not self.raw_view:
+            return
+        band_arg = {"2.4GHz": "bg", "5GHz": "a", "Both": "abg"}.get(self.current_band.get(), "abg")
+        cmd = ["airodump-ng", "--band", band_arg, self.mon_iface]
+        if _airodump_supports("--color"):
+            cmd.append("--color")
+        self.raw_view.start(cmd)
+
+    def _start_raw_view_lock(self, channel: int, bssid: str):
+        if not self.mon_iface or not self.raw_view:
+            return
+        cmd = ["airodump-ng", "-c", str(channel), "--bssid", bssid, self.mon_iface]
+        if _airodump_supports("--color"):
+            cmd.append("--color")
+        self.raw_view.start(cmd)
+
     def _stop_monitor(self):
         self.worker.stop()
+        if self.raw_view:
+            self.raw_view.stop()
         if self.mon_iface:
             self.airmon.stop_monitor(self.mon_iface)
             self.mon_iface = None
@@ -1266,6 +1459,7 @@ class N2NgApp:
         base.mkdir(parents=True, exist_ok=True)
         prefix = str(base / f"capture_{time.strftime('%Y-%m-%d_%H-%M-%S')}")
         self.worker.start_lock(self.mon_iface, int(ch), bssid, prefix)
+        self._start_raw_view_lock(int(ch), bssid)
         self.capture_manager.set_active_cap(Path(f"{prefix}-01.cap"))
         self._poll_capture()
         self.channel_pill.config(text=f"LOCKED: CH {ch}", bg="green")
@@ -1398,6 +1592,11 @@ class N2NgApp:
                 self._notify_capture("PMKID Captured", payload["file"])
             elif event == "error":
                 self._log(f"ERROR: {payload}")
+
+        # Update Raw View if it exists.
+        if self.raw_view:
+            self.raw_view.flush()
+
         self.poll_id = self.root.after(150, self._poll_queue)
 
     def _notify_capture(self, title: str, path: str):

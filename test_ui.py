@@ -171,3 +171,21 @@ def test_clients_filtered_by_locked_target():
     assert "44:55:66:77:88:99" not in stations
 
     root.destroy()
+
+
+def test_ansi_parser_produces_tags():
+    """ANSI SGR codes must be stripped and returned as tag ranges."""
+    parser = _n2ng.AnsiParser()
+    text, tags = parser.parse("\x1b[32mWPA2\x1b[0m plain")
+    assert text == "WPA2 plain"
+    assert any(tag == "ansi_fg_32" and start == 0 and end == 4 for tag, start, end in tags)
+
+
+def test_raw_view_widget_exists():
+    """Raw View tab must contain a tk.Text widget."""
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    assert hasattr(app, "raw_view")
+    assert isinstance(app.raw_view, _n2ng.AirodumpRawView)
+    root.destroy()
