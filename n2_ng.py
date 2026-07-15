@@ -287,6 +287,263 @@ class AirodumpWorker(threading.Thread):
             time.sleep(1.5)
 
 
+class N2NgApp:
+    """Main tkinter application."""
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("N2-ng")
+        self.root.geometry("1200x700")
+        self.root.minsize(1000, 600)
+        self.root.configure(bg=THEME["bg"])
+
+        self.queue = queue.Queue()
+        self.airmon = AirmonManager()
+        self.worker = AirodumpWorker(self.queue)
+        self.capture_manager = None  # set in Task 8
+        self.attack = None  # set in Task 7
+
+        self.networks: dict[str, dict] = {}
+        self.clients: list[dict] = []
+        self.locked_target: dict | None = None
+        self.mon_iface: str | None = None
+        self.current_band = tk.StringVar(value="Both")
+        self.adapter_var = tk.StringVar()
+        self.poll_id = None
+
+        self._build_ui()
+        self._refresh_adapters()
+        self._poll_queue()
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        atexit.register(self._cleanup)
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        self._build_toolbar()
+
+        main_frame = tk.Frame(self.root, bg=THEME["bg"])
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Left: network tree
+        left_frame = tk.Frame(main_frame, bg=THEME["bg"])
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._build_network_tree(left_frame)
+
+        # Right: detail panel
+        right_frame = tk.Frame(main_frame, bg=THEME["bg"], width=420)
+        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+        right_frame.pack_propagate(False)
+        self._build_right_panel(right_frame)
+
+        self._build_status_bar()
+
+    def _build_toolbar(self):
+        toolbar = tk.Frame(self.root, bg=THEME["panel"])
+        toolbar.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        tk.Label(toolbar, text="Adapter:", bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        self.adapter_combo = tk.OptionMenu(toolbar, self.adapter_var, "")
+        self.adapter_combo.config(bg=THEME["panel"], fg=THEME["fg"], highlightthickness=0)
+        self.adapter_combo["menu"].config(bg=THEME["panel"], fg=THEME["fg"])
+        self.adapter_combo.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(toolbar, text="Band:", bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        band_menu = tk.OptionMenu(toolbar, self.current_band, "2.4GHz", "5GHz", "Both")
+        band_menu.config(bg=THEME["panel"], fg=THEME["fg"], highlightthickness=0)
+        band_menu["menu"].config(bg=THEME["panel"], fg=THEME["fg"])
+        band_menu.pack(side=tk.LEFT, padx=5)
+
+        tk.Button(toolbar, text="Start Monitor", command=self._start_monitor, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="Stop Monitor", command=self._stop_monitor, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="WPS Scan", command=self._wps_scan, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="Refresh Adapters", command=self._refresh_adapters, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+
+        self.channel_pill = tk.Label(toolbar, text="SCANNING ALL", bg="red", fg="white", font=("TkDefaultFont", 10, "bold"))
+        self.channel_pill.pack(side=tk.RIGHT, padx=10)
+
+    def _build_network_tree(self, parent):
+        cols = ("pwr", "beacons", "data", "ch", "mb", "enc", "cipher", "auth", "essid", "bssid")
+        self.tree = ttk.Treeview(parent, columns=cols, show="headings", selectmode="browse")
+        headings = {
+            "pwr": "PWR", "beacons": "Beacons", "data": "#Data", "ch": "CH",
+            "mb": "MB", "enc": "ENC", "cipher": "CIPHER", "auth": "AUTH",
+            "essid": "ESSID", "bssid": "BSSID",
+        }
+        for c in cols:
+            self.tree.heading(c, text=headings[c])
+            self.tree.column(c, width=80, anchor=tk.CENTER)
+        self.tree.column("essid", width=150)
+        self.tree.column("bssid", width=130)
+
+        vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.tree.yview)
+        hsb = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        self.tree.bind("<Double-1>", self._on_network_double_click)
+        self.tree.bind("<Button-3>", self._on_network_right_click)
+
+    def _build_right_panel(self, parent):
+        self.target_card = tk.LabelFrame(parent, text="Target", bg=THEME["panel"], fg=THEME["fg"])
+        self.target_card.pack(fill=tk.X, padx=5, pady=5)
+        self.target_label = tk.Label(self.target_card, text="No target locked", bg=THEME["panel"], fg=THEME["fg"], justify=tk.LEFT)
+        self.target_label.pack(anchor=tk.W, padx=5, pady=5)
+
+        # Placeholder: client table, signal graph, attacks added in later tasks
+        placeholder = tk.Label(parent, text="Detail panel under construction", bg=THEME["bg"], fg=THEME["fg"])
+        placeholder.pack(fill=tk.BOTH, expand=True)
+
+    def _build_status_bar(self):
+        self.status = tk.Label(self.root, text="Ready", bg=THEME["panel"], fg=THEME["fg"], anchor=tk.W)
+        self.status.pack(side=tk.BOTTOM, fill=tk.X)
+
+    # ------------------------------------------------------------------
+    # Event handling
+    # ------------------------------------------------------------------
+    def _refresh_adapters(self):
+        ifaces = self.airmon.list_physical_interfaces()
+        menu = self.adapter_combo["menu"]
+        menu.delete(0, tk.END)
+        for iface in ifaces:
+            menu.add_command(label=iface, command=lambda v=iface: self.adapter_var.set(v))
+        if ifaces and not self.adapter_var.get():
+            self.adapter_var.set(ifaces[0])
+
+    def _start_monitor(self):
+        iface = self.adapter_var.get()
+        if not iface:
+            messagebox.showwarning("N2-ng", "No adapter selected.")
+            return
+        self._log(f"Starting monitor mode on {iface}")
+        try:
+            self.mon_iface = self.airmon.start_monitor(iface)
+            self.status.config(text=f"Monitor: {self.mon_iface}")
+            self.worker.start_scan(self.mon_iface, self.current_band.get(), "/tmp/n2ng_scan")
+        except Exception as e:
+            messagebox.showerror("N2-ng", f"Failed to start monitor mode: {e}")
+
+    def _stop_monitor(self):
+        self.worker.stop()
+        if self.mon_iface:
+            self.airmon.stop_monitor(self.mon_iface)
+            self.mon_iface = None
+        self.status.config(text="Monitor stopped")
+        self.channel_pill.config(text="SCANNING ALL", bg="red")
+
+    def _wps_scan(self):
+        messagebox.showinfo("N2-ng", "WPS scan will be implemented in Task 9.")
+
+    def _on_network_double_click(self, event):
+        item = self.tree.selection()
+        if not item:
+            return
+        bssid = self.tree.item(item[0], "values")[-1]
+        messagebox.showinfo("N2-ng", f"Target lock for {bssid} will be implemented in Task 6.")
+
+    def _on_network_right_click(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        self.tree.selection_set(item)
+        bssid = self.tree.item(item, "values")[-1]
+        essid = self.tree.item(item, "values")[-2]
+        menu = tk.Menu(self.root, tearoff=0, bg=THEME["panel"], fg=THEME["fg"])
+        menu.add_command(label="Copy BSSID", command=lambda: self._copy_to_clipboard(bssid))
+        menu.add_command(label="Copy ESSID", command=lambda: self._copy_to_clipboard(essid))
+        menu.add_command(label="Lock Target", command=lambda: self._lock_target_from_bssid(bssid))
+        menu.post(event.x_root, event.y_root)
+
+    def _copy_to_clipboard(self, text: str):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _lock_target_from_bssid(self, bssid: str):
+        messagebox.showinfo("N2-ng", f"Target lock for {bssid} will be implemented in Task 6.")
+
+    # ------------------------------------------------------------------
+    # Queue / network updates
+    # ------------------------------------------------------------------
+    def _poll_queue(self):
+        while not self.queue.empty():
+            event, payload = self.queue.get_nowait()
+            if event == "networks":
+                self._update_networks(payload)
+            elif event == "clients":
+                self.clients = payload
+            elif event == "error":
+                self._log(f"ERROR: {payload}")
+        self.poll_id = self.root.after(150, self._poll_queue)
+
+    def _update_networks(self, networks: list[dict]):
+        # Keep existing entries so selections survive; update or insert
+        current = set(self.tree.get_children())
+        seen = set()
+        for net in networks:
+            bssid = net["bssid"]
+            seen.add(bssid)
+            values = (
+                net.get("power", ""), net.get("beacons", ""), net.get("iv", ""),
+                net.get("channel", ""), net.get("speed", ""), net.get("privacy", ""),
+                net.get("cipher", ""), net.get("auth", ""), net.get("essid", ""), bssid,
+            )
+            tag = self._privacy_tag(net.get("privacy", ""))
+            if bssid in self.networks:
+                self.tree.item(bssid, values=values, tags=(tag,))
+            else:
+                self.tree.insert("", tk.END, iid=bssid, values=values, tags=(tag,))
+            self.networks[bssid] = net
+        # Remove stale
+        for bssid in current - seen:
+            self.tree.delete(bssid)
+            self.networks.pop(bssid, None)
+        # Color config
+        self.tree.tag_configure("OPN", foreground="#00ff41")
+        self.tree.tag_configure("WEP", foreground="#ff4444")
+        self.tree.tag_configure("WPA", foreground="#ffcc00")
+        self.tree.tag_configure("WPA2", foreground="#ffffff")
+        self.tree.tag_configure("WPA3", foreground="#00ccff")
+
+    @staticmethod
+    def _privacy_tag(privacy: str) -> str:
+        p = privacy.upper()
+        if "WPA3" in p:
+            return "WPA3"
+        if "WPA2" in p:
+            return "WPA2"
+        if "WPA" in p:
+            return "WPA"
+        if "WEP" in p:
+            return "WEP"
+        return "OPN"
+
+    def _log(self, msg: str):
+        print(f"[N2-ng] {msg}")
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+    def _on_close(self):
+        self._cleanup()
+        self.root.destroy()
+
+    def _cleanup(self):
+        if self.poll_id:
+            self.root.after_cancel(self.poll_id)
+            self.poll_id = None
+        self.worker.stop()
+        self.airmon.cleanup()
+
+    def run(self):
+        self.root.mainloop()
+
+
 def ensure_root():
     if os.geteuid() == 0:
         return
@@ -319,4 +576,6 @@ def ensure_root():
 
 if __name__ == "__main__":
     ensure_root()
-    print("Running as root, N2-ng bootstrap OK")
+    root = tk.Tk()
+    app = N2NgApp(root)
+    app.run()
