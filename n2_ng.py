@@ -401,6 +401,92 @@ class AttackController:
         threading.Thread(target=self._run, args=(cmd,), daemon=True).start()
 
 
+class CaptureManager:
+    """Manage capture files, poll .cap for handshake/PMKID, and convert to .22000."""
+
+    def __init__(self, event_queue: queue.Queue, log_func):
+        self.queue = event_queue
+        self.log = log_func
+        self.active_cap: Path | None = None
+        self.handshake_found = False
+        self.pmkid_found = False
+        self._last_size = 0
+
+    def set_active_cap(self, cap_path: Path):
+        self.active_cap = cap_path
+        self.handshake_found = False
+        self.pmkid_found = False
+        self._last_size = 0
+
+    def get_size(self) -> int:
+        if self.active_cap and self.active_cap.exists():
+            return self.active_cap.stat().st_size
+        return 0
+
+    def poll(self):
+        if not self.active_cap or not self.active_cap.exists():
+            return
+        size = self.get_size()
+        if size == self._last_size:
+            return
+        self._last_size = size
+        out22000 = self.active_cap.with_suffix(".22000")
+        tmp = self.active_cap.with_suffix(".tmp22000")
+        rc = None
+        if shutil.which("hcxpcapngtool"):
+            rc = subprocess.run(
+                ["hcxpcapngtool", "-o", str(tmp), str(self.active_cap)],
+                capture_output=True, text=True
+            )
+        elif shutil.which("aircrack-ng"):
+            base = str(tmp.with_suffix(""))
+            rc = subprocess.run(
+                ["aircrack-ng", str(self.active_cap), "-J", base],
+                capture_output=True, text=True
+            )
+            tmp = Path(base + ".hccap")
+        else:
+            return
+        if rc and rc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            shutil.move(str(tmp), str(out22000))
+            self._classify(out22000)
+        elif tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+    def _classify(self, path: Path):
+        text = path.read_text(errors="ignore")
+        if "WPA*02" in text and not self.handshake_found:
+            self.handshake_found = True
+            self.queue.put(("handshake", {"file": str(path), "type": "handshake"}))
+        if "WPA*01" in text and not self.pmkid_found:
+            self.pmkid_found = True
+            self.queue.put(("pmkid", {"file": str(path), "type": "pmkid"}))
+
+    def convert(self, cap: Path) -> Path | None:
+        out = cap.with_suffix(".22000")
+        if shutil.which("hcxpcapngtool"):
+            rc = subprocess.run(["hcxpcapngtool", "-o", str(out), str(cap)], capture_output=True, text=True)
+            if rc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+                return out
+        return None
+
+    def merge(self, caps: list[Path], output: Path) -> bool:
+        if not shutil.which("mergecap"):
+            return False
+        cmd = ["mergecap", "-w", str(output)] + [str(c) for c in caps]
+        rc = subprocess.run(cmd, capture_output=True, text=True)
+        return rc.returncode == 0 and output.exists() and output.stat().st_size > 0
+
+    def fix(self, cap: Path) -> Path | None:
+        if not shutil.which("pcapfix"):
+            return None
+        out = cap.with_suffix(".fixed.cap")
+        rc = subprocess.run(["pcapfix", str(cap), str(out)], capture_output=True, text=True)
+        if rc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            return out
+        return None
+
+
 class N2NgApp:
     """Main tkinter application."""
 
@@ -414,7 +500,7 @@ class N2NgApp:
         self.queue = queue.Queue()
         self.airmon = AirmonManager()
         self.worker = AirodumpWorker(self.queue)
-        self.capture_manager = None  # set in Task 8
+        self.capture_manager = CaptureManager(self.queue, self._log)
         self.attack = AttackController(self._log)
 
         self.networks: dict[str, dict] = {}
@@ -621,6 +707,8 @@ class N2NgApp:
         base.mkdir(parents=True, exist_ok=True)
         prefix = str(base / f"capture_{time.strftime('%Y-%m-%d_%H-%M-%S')}")
         self.worker.start_lock(self.mon_iface, int(ch), bssid, prefix)
+        self.capture_manager.set_active_cap(Path(f"{prefix}-01.cap"))
+        self._poll_capture()
         self.channel_pill.config(text=f"LOCKED: CH {ch}", bg="green")
         self._update_target_card(net)
         self._log(f"Locked target {net['essid']} ({bssid}) on channel {ch}")
@@ -657,6 +745,12 @@ class N2NgApp:
             self.size_label.config(text=f"Capture: {human_size(size)}")
         if self.locked_target:
             self.root.after(1000, self._start_capture_size_monitor)
+
+    def _poll_capture(self):
+        if self.capture_manager:
+            self.capture_manager.poll()
+        if self.locked_target:
+            self.root.after(5000, self._poll_capture)
 
     # ------------------------------------------------------------------
     # Attack handlers
@@ -726,9 +820,18 @@ class N2NgApp:
                 self._update_networks(payload)
             elif event == "clients":
                 self._update_clients(payload)
+            elif event == "handshake":
+                self._notify_capture("WPA Handshake Captured", payload["file"])
+            elif event == "pmkid":
+                self._notify_capture("PMKID Captured", payload["file"])
             elif event == "error":
                 self._log(f"ERROR: {payload}")
         self.poll_id = self.root.after(150, self._poll_queue)
+
+    def _notify_capture(self, title: str, path: str):
+        self.status.config(text=f"{title}: {path}", bg="green", fg="black")
+        self._log(f"{title}: {path}")
+        messagebox.showinfo(title, f"{title}\n\nFile: {path}")
 
     def _update_clients(self, clients: list[dict]):
         self.clients = clients
