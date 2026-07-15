@@ -16,6 +16,7 @@ import time
 from collections import deque
 from pathlib import Path
 import tkinter as tk
+import tkinter.font as tk_font
 from tkinter import messagebox, simpledialog, ttk
 
 
@@ -999,6 +1000,7 @@ class N2NgApp:
         self.attack = AttackController(self._log)
 
         self.networks: dict[str, dict] = {}
+        self._networks_prev: dict[str, dict] = {}
         self.clients: list[dict] = []
         self.locked_target: dict | None = None
         self.mon_iface: str | None = None
@@ -1025,17 +1027,25 @@ class N2NgApp:
         # Prefer the clam theme because it reliably honors custom colors.
         if "clam" in style.theme_names():
             style.theme_use("clam")
+        if "Consolas" in tk_font.families():
+            self.mono_font = ("Consolas", 10)
+            self.mono_font_bold = ("Consolas", 10, "bold")
+        else:
+            self.mono_font = ("Courier", 10)
+            self.mono_font_bold = ("Courier", 10, "bold")
         style.configure(
             "Treeview",
             background=THEME["bg"],
             foreground=THEME["fg"],
             fieldbackground=THEME["bg"],
-            rowheight=22,
+            font=self.mono_font,
+            rowheight=18,
         )
         style.configure(
             "Treeview.Heading",
             background=THEME["panel"],
             foreground=THEME["fg"],
+            font=self.mono_font_bold,
         )
         style.map(
             "Treeview",
@@ -1698,17 +1708,23 @@ class N2NgApp:
                 )
 
     def _update_networks(self, networks: list[dict]):
+        flash_bssids = set()
         for net in networks:
             bssid = net["bssid"]
             old = self.networks.get(bssid)
             if old and old.get("essid") == "[Hidden]" and net.get("essid") and net.get("essid") != "[Hidden]":
                 self._log(f"Revealed hidden ESSID: {net['essid']} ({bssid})")
+            # Detect PWR or Beacons change to flash the row.
+            prev = self._networks_prev.get(bssid)
+            if prev and (prev.get("power") != net.get("power") or prev.get("beacons") != net.get("beacons")):
+                flash_bssids.add(bssid)
             self.networks[bssid] = net
+            self._networks_prev[bssid] = {"power": net.get("power", ""), "beacons": net.get("beacons", "")}
             if self.locked_target and self.locked_target["bssid"] == bssid:
                 self.locked_target = net
                 self._update_target_card(net)
                 self.signal_graph.add_sample(net.get("power", -100))
-        self._refresh_tree()
+        self._refresh_tree(flash_bssids=flash_bssids)
 
     def _filter_networks(self, networks: list[dict]) -> list[dict]:
         filt = self.settings.get("filter_encryption")
@@ -1767,8 +1783,9 @@ class N2NgApp:
             net.get("cipher", ""), net.get("auth", ""), net.get("essid", ""), net["bssid"],
         )
 
-    def _refresh_tree(self):
+    def _refresh_tree(self, flash_bssids: set[str] | None = None):
         # Refresh the tree in-place to avoid full rebuild flicker at 6-7 FPS.
+        flash_bssids = flash_bssids or set()
         selected = set(self.tree.selection())
         networks = list(self.networks.values())
         networks = self._filter_networks(networks)
@@ -1785,10 +1802,15 @@ class N2NgApp:
             bssid = net["bssid"]
             values = self._network_values(net)
             tag = self._privacy_tag(net.get("privacy", ""))
+            tags = (tag,)
+            if bssid in flash_bssids:
+                tags = (tag, "flash")
+                self.tree.tag_configure("flash", background="#ffff00", foreground="#000000")
+                self.root.after(200, lambda b=bssid, t=tag: self._unflash_row(b, t))
             if self.tree.exists(bssid):
-                self.tree.item(bssid, values=values, tags=(tag,))
+                self.tree.item(bssid, values=values, tags=tags)
             else:
-                self.tree.insert("", tk.END, iid=bssid, values=values, tags=(tag,))
+                self.tree.insert("", tk.END, iid=bssid, values=values, tags=tags)
 
         # Restore selection if item still exists.
         for bssid in selected:
@@ -1801,6 +1823,10 @@ class N2NgApp:
         self.tree.tag_configure("WPA", foreground="#ffcc00")
         self.tree.tag_configure("WPA2", foreground="#ffffff")
         self.tree.tag_configure("WPA3", foreground="#00ccff")
+
+    def _unflash_row(self, bssid: str, tag: str):
+        if self.tree.exists(bssid):
+            self.tree.item(bssid, tags=(tag,))
 
     @staticmethod
     def _privacy_tag(privacy: str) -> str:

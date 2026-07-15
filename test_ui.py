@@ -189,3 +189,32 @@ def test_raw_view_widget_exists():
     assert hasattr(app, "raw_view")
     assert isinstance(app.raw_view, _n2ng.AirodumpRawView)
     root.destroy()
+
+
+def test_treeview_is_monospace():
+    """Network Treeview must use a monospace font."""
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    style = ttk.Style(root)
+    font = style.lookup("Treeview", "font")
+    assert "Courier" in font or "Consolas" in font, f"unexpected Treeview font: {font!r}"
+    root.destroy()
+
+
+def test_flash_on_power_update():
+    """A row should temporarily get a flash tag when PWR changes."""
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    bssid = "AA:BB:CC:DD:EE:FF"
+    net = {
+        "bssid": bssid, "essid": "Net", "power": "-50", "beacons": "10",
+        "iv": "0", "channel": "6", "speed": "54", "privacy": "WPA2",
+        "cipher": "CCMP", "auth": "PSK", "manufacturer": "",
+    }
+    app._networks_prev[bssid] = {"power": "-60", "beacons": "10"}
+    app._update_networks([net])
+    tags = app.tree.item(bssid, "tags")
+    assert "flash" in tags
+    root.destroy()
