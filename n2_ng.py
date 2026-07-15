@@ -1480,14 +1480,23 @@ class N2NgApp:
     def _update_clients(self, clients: list[dict]):
         self.clients = clients
         self.client_tree.delete(*self.client_tree.get_children())
-        if self.locked_target:
-            bssid = self.locked_target["bssid"]
-            for c in clients:
-                if c.get("bssid") == bssid or c.get("bssid") == "(not associated)":
-                    self.client_tree.insert(
-                        "", tk.END,
-                        values=(c.get("station", ""), c.get("power", ""), c.get("packets", ""), c.get("probed", "")),
-                    )
+        if not self.locked_target:
+            return
+        target_bssid = self.locked_target["bssid"]
+        target_essid = self.locked_target.get("essid", "")
+        for c in clients:
+            bssid = c.get("bssid", "")
+            probed = c.get("probed", "")
+            matches = bssid == target_bssid
+            if not matches and target_essid and target_essid != "[Hidden]":
+                matches = target_essid in probed
+            if bssid == "(not associated)" and target_essid and target_essid in probed:
+                matches = True
+            if matches:
+                self.client_tree.insert(
+                    "", tk.END,
+                    values=(c.get("station", ""), c.get("power", ""), c.get("packets", ""), c.get("probed", "")),
+                )
 
     def _update_networks(self, networks: list[dict]):
         for net in networks:

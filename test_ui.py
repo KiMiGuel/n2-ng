@@ -146,3 +146,28 @@ def test_right_panel_is_scrollable():
     assert str(app.right_scrollbar.cget("orient")) == "vertical"
 
     root.destroy()
+
+
+def test_clients_filtered_by_locked_target():
+    """Only clients associated with the locked target should appear."""
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+
+    app.locked_target = {"bssid": "AA:BB:CC:DD:EE:FF", "essid": "MyWiFi"}
+    app.clients = [
+        {"station": "11:22:33:44:55:66", "power": "-60", "packets": "50", "bssid": "AA:BB:CC:DD:EE:FF", "probed": ""},
+        {"station": "22:33:44:55:66:77", "power": "-70", "packets": "10", "bssid": "(not associated)", "probed": "MyWiFi"},
+        {"station": "33:44:55:66:77:88", "power": "-80", "packets": "5", "bssid": "BB:BB:BB:BB:BB:BB", "probed": ""},
+        {"station": "44:55:66:77:88:99", "power": "-85", "packets": "2", "bssid": "(not associated)", "probed": "OtherNet"},
+    ]
+    app._update_clients(app.clients)
+
+    values = [app.client_tree.item(child, "values") for child in app.client_tree.get_children()]
+    stations = {v[0] for v in values}
+    assert "11:22:33:44:55:66" in stations
+    assert "22:33:44:55:66:77" in stations
+    assert "33:44:55:66:77:88" not in stations
+    assert "44:55:66:77:88:99" not in stations
+
+    root.destroy()
