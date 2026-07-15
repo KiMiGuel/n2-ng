@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# N2-ng launcher
+# Runs the Python GUI, which will prompt for sudo if not root.
+cd "$(dirname "$0")" || exit 1
+exec python3 n2_ng.py "$@"

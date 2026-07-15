@@ -54,6 +54,18 @@ def human_size(size: int) -> str:
     return f"{size:.1f} GB"
 
 
+def user_home() -> Path:
+    """Return the original user's home directory even when running under sudo."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            import pwd
+            return Path(pwd.getpwnam(sudo_user).pw_dir)
+        except Exception:
+            pass
+    return Path.home()
+
+
 class DependencyChecker:
     TOOLS = {
         "aircrack-ng": {
@@ -854,7 +866,7 @@ class N2NgApp:
         ch = net.get("channel", "1")
         # Set system channel to prevent aireplay-ng mismatch
         subprocess.run(["iw", "dev", self.mon_iface, "set", "channel", str(ch)], capture_output=True)
-        base = Path.home() / "hs" / "n2-ng" / sanitize_essid(net["essid"], bssid)
+        base = user_home() / "hs" / "n2-ng" / sanitize_essid(net["essid"], bssid)
         base.mkdir(parents=True, exist_ok=True)
         prefix = str(base / f"capture_{time.strftime('%Y-%m-%d_%H-%M-%S')}")
         self.worker.start_lock(self.mon_iface, int(ch), bssid, prefix)
@@ -890,7 +902,7 @@ class N2NgApp:
         if not self.locked_target:
             return
         # Find the latest .cap in the target directory
-        base = Path.home() / "hs" / "n2-ng" / sanitize_essid(self.locked_target["essid"], self.locked_target["bssid"])
+        base = user_home() / "hs" / "n2-ng" / sanitize_essid(self.locked_target["essid"], self.locked_target["bssid"])
         caps = sorted(base.glob("*.cap"))
         if caps:
             size = caps[-1].stat().st_size
@@ -988,7 +1000,7 @@ class N2NgApp:
 
     def _refresh_history(self):
         self.history_list.delete(0, tk.END)
-        base = Path.home() / "hs" / "n2-ng"
+        base = user_home() / "hs" / "n2-ng"
         if not base.exists():
             return
         for cap in sorted(base.rglob("*.cap")):
