@@ -487,6 +487,46 @@ class CaptureManager:
         return None
 
 
+class WpsScanner(threading.Thread):
+    """Run wash or reaver --scan and report lines via callback."""
+
+    def __init__(self, mon_iface: str, callback):
+        super().__init__(daemon=True)
+        self.mon_iface = mon_iface
+        self.callback = callback
+        self._stop = threading.Event()
+        self._proc = None
+
+    def run(self):
+        cmd = None
+        if shutil.which("wash"):
+            cmd = ["wash", "-i", self.mon_iface]
+        elif shutil.which("reaver"):
+            cmd = ["reaver", "-i", self.mon_iface, "--scan"]
+        else:
+            self.callback("error", "wash/reaver not found")
+            return
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        while not self._stop.is_set():
+            line = self._proc.stdout.readline()
+            if not line:
+                break
+            self.callback("wps_line", line.strip())
+        self._proc.terminate()
+
+    def stop(self):
+        self._stop.set()
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+
+
 class N2NgApp:
     """Main tkinter application."""
 
@@ -622,6 +662,18 @@ class N2NgApp:
         for label, kind in (("Fake Authentication", "fakeauth"), ("ARP Replay", "arpreplay"), ("Chopchop", "chopchop"), ("Fragmentation", "fragmentation")):
             tk.Button(self.legacy_frame, text=label, command=lambda k=kind: self._legacy_attack(k), bg=THEME["panel"], fg=THEME["fg"]).pack(fill=tk.X, padx=5, pady=2)
 
+        # Auto-deauth loop for handshake capture
+        auto_frame = tk.LabelFrame(parent, text="Capture Handshake", bg=THEME["panel"], fg=THEME["fg"])
+        auto_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.auto_deauth_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(auto_frame, text="Auto-deauth until handshake", variable=self.auto_deauth_var, command=self._toggle_auto_deauth, bg=THEME["panel"], fg=THEME["fg"], selectcolor=THEME["panel"]).pack(anchor=tk.W, padx=5)
+        interval_frame = tk.Frame(auto_frame, bg=THEME["panel"])
+        interval_frame.pack(anchor=tk.W, padx=5)
+        tk.Label(interval_frame, text="Interval:", bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT)
+        self.deauth_interval_var = tk.StringVar(value="10")
+        tk.OptionMenu(interval_frame, self.deauth_interval_var, "10", "30", "60").pack(side=tk.LEFT)
+        tk.Label(interval_frame, text="seconds", bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT)
+
     def _toggle_legacy(self):
         if self.legacy_visible.get():
             self.legacy_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -666,7 +718,65 @@ class N2NgApp:
         self.channel_pill.config(text="SCANNING ALL", bg="red")
 
     def _wps_scan(self):
-        messagebox.showinfo("N2-ng", "WPS scan will be implemented in Task 9.")
+        if not self.mon_iface:
+            messagebox.showwarning("N2-ng", "Start monitor mode first.")
+            return
+        self._log("Starting WPS scan...")
+        self.wps_lines = []
+        self.wps_dialog = tk.Toplevel(self.root)
+        self.wps_dialog.title("WPS Scan")
+        self.wps_dialog.configure(bg=THEME["bg"])
+        self.wps_dialog.geometry("700x400")
+        text = tk.Text(self.wps_dialog, bg=THEME["bg"], fg=THEME["fg"], state=tk.DISABLED)
+        text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.wps_text = text
+        self.wps_scanner = WpsScanner(self.mon_iface, self._on_wps_event)
+        self.wps_scanner.start()
+        tk.Button(self.wps_dialog, text="Stop", command=self._stop_wps_scan, bg=THEME["panel"], fg=THEME["fg"]).pack(pady=5)
+
+    def _on_wps_event(self, event, payload):
+        if event == "wps_line":
+            self.wps_lines.append(payload)
+            self.root.after(0, self._update_wps_text)
+        elif event == "error":
+            self._log(f"WPS scan error: {payload}")
+
+    def _update_wps_text(self):
+        if hasattr(self, "wps_text") and self.wps_text.winfo_exists():
+            self.wps_text.config(state=tk.NORMAL)
+            self.wps_text.delete("1.0", tk.END)
+            self.wps_text.insert(tk.END, "\n".join(self.wps_lines[-200:]))
+            self.wps_text.see(tk.END)
+            self.wps_text.config(state=tk.DISABLED)
+
+    def _stop_wps_scan(self):
+        if hasattr(self, "wps_scanner"):
+            self.wps_scanner.stop()
+        if hasattr(self, "wps_dialog") and self.wps_dialog.winfo_exists():
+            self.wps_dialog.destroy()
+
+    def _toggle_auto_deauth(self):
+        if self.auto_deauth_var.get():
+            if not self.locked_target or not self.mon_iface:
+                messagebox.showwarning("N2-ng", "Lock a target first.")
+                self.auto_deauth_var.set(False)
+                return
+            self._log("Auto-deauth loop started")
+            self._auto_deauth_tick()
+        else:
+            self._log("Auto-deauth loop stopped")
+
+    def _auto_deauth_tick(self):
+        if not self.auto_deauth_var.get() or not self.locked_target or not self.mon_iface:
+            return
+        if self.capture_manager and (self.capture_manager.handshake_found or self.capture_manager.pmkid_found):
+            self._log("Handshake/PMKID captured, stopping auto-deauth")
+            self.auto_deauth_var.set(False)
+            return
+        bssid = self.locked_target["bssid"]
+        self.attack.deauth_all(bssid, self.mon_iface, count=5)
+        interval = int(self.deauth_interval_var.get()) * 1000
+        self.root.after(interval, self._auto_deauth_tick)
 
     def _on_network_double_click(self, event):
         item = self.tree.selection()
