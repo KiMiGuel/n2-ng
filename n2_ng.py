@@ -117,7 +117,7 @@ class AirmonManager:
             for line in out.splitlines()[2:]:
                 parts = line.split()
                 # airmon-ng layout: phyN <iface> <driver> <chipset>
-                if len(parts) >= 2 and parts[1].startswith(("wlan", "wlp")):
+                if len(parts) >= 2 and parts[1].startswith(("wlan", "wlp")) and not parts[1].endswith("mon"):
                     result.append(parts[1])
         except Exception:
             pass
@@ -127,7 +127,7 @@ class AirmonManager:
                 m = re.search(r"^(?:\\d+:\\s+)?([ew]lan\\d+|wlp\\S+?):", line)
                 if m:
                     name = m.group(1)
-                    if name not in result:
+                    if name not in result and not name.endswith("mon"):
                         result.append(name)
         except Exception:
             pass
@@ -244,7 +244,7 @@ class AirodumpWorker(threading.Thread):
         ]
         self._running.set()
         self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         if not self.is_alive():
             self.start()
@@ -263,7 +263,7 @@ class AirodumpWorker(threading.Thread):
         ]
         self._running.set()
         self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         if not self.is_alive():
             self.start()
