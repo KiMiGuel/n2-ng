@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+*.cap
+*.csv
+*.22000
+*.hccapx
+*.kismet.*
+*.log.csv
