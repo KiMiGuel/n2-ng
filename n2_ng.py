@@ -287,6 +287,42 @@ class AirodumpWorker(threading.Thread):
             time.sleep(1.5)
 
 
+class SignalGraph:
+    """Simple tkinter Canvas line graph for received signal strength."""
+
+    def __init__(self, parent):
+        self.canvas = tk.Canvas(parent, bg=THEME["panel"], height=120, highlightthickness=0)
+        self.canvas.pack(fill=tk.X, padx=5, pady=5)
+        self.samples = deque(maxlen=60)
+
+    def add_sample(self, pwr):
+        try:
+            val = int(pwr)
+        except (TypeError, ValueError):
+            val = -100
+        self.samples.append(val)
+        self._draw()
+
+    def _draw(self):
+        self.canvas.delete("all")
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w < 10:
+            self.canvas.after(100, self._draw)
+            return
+        for y in range(0, h, 20):
+            self.canvas.create_line(0, y, w, y, fill="#333333")
+        if len(self.samples) < 2:
+            return
+        step = w / (len(self.samples) - 1)
+        points = []
+        for i, val in enumerate(self.samples):
+            y = h - ((max(-90, min(-30, val)) + 90) / 60) * h
+            points.append((i * step, y))
+        flat = [c for p in points for c in p]
+        self.canvas.create_line(flat, fill=THEME["accent"], width=2)
+
+
 class N2NgApp:
     """Main tkinter application."""
 
@@ -395,10 +431,25 @@ class N2NgApp:
         self.target_card.pack(fill=tk.X, padx=5, pady=5)
         self.target_label = tk.Label(self.target_card, text="No target locked", bg=THEME["panel"], fg=THEME["fg"], justify=tk.LEFT)
         self.target_label.pack(anchor=tk.W, padx=5, pady=5)
+        self.size_label = tk.Label(self.target_card, text="Capture: 0 B", bg=THEME["panel"], fg=THEME["fg"])
+        self.size_label.pack(anchor=tk.W, padx=5, pady=2)
 
-        # Placeholder: client table, signal graph, attacks added in later tasks
-        placeholder = tk.Label(parent, text="Detail panel under construction", bg=THEME["bg"], fg=THEME["fg"])
-        placeholder.pack(fill=tk.BOTH, expand=True)
+        # Client table
+        client_frame = tk.LabelFrame(parent, text="Clients", bg=THEME["panel"], fg=THEME["fg"])
+        client_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.client_tree = ttk.Treeview(client_frame, columns=("station", "pwr", "pkts", "probed"), show="headings", height=5)
+        for c, h in (("station", "STATION"), ("pwr", "PWR"), ("pkts", "Pkts"), ("probed", "Probed ESSID")):
+            self.client_tree.heading(c, text=h)
+            self.client_tree.column(c, width=90)
+        self.client_tree.pack(fill=tk.X)
+
+        # Signal graph
+        self.signal_graph = SignalGraph(parent)
+
+        # Attack panel placeholder (filled in Task 7)
+        self.attack_frame = tk.LabelFrame(parent, text="Attacks", bg=THEME["panel"], fg=THEME["fg"])
+        self.attack_frame.pack(fill=tk.X, padx=5, pady=5)
+        tk.Label(self.attack_frame, text="Attack controls will appear here", bg=THEME["panel"], fg=THEME["fg"]).pack(pady=20)
 
     def _build_status_bar(self):
         self.status = tk.Label(self.root, text="Ready", bg=THEME["panel"], fg=THEME["fg"], anchor=tk.W)
@@ -445,7 +496,7 @@ class N2NgApp:
         if not item:
             return
         bssid = self.tree.item(item[0], "values")[-1]
-        messagebox.showinfo("N2-ng", f"Target lock for {bssid} will be implemented in Task 6.")
+        self._lock_target(bssid)
 
     def _on_network_right_click(self, event):
         item = self.tree.identify_row(event.y)
@@ -457,15 +508,64 @@ class N2NgApp:
         menu = tk.Menu(self.root, tearoff=0, bg=THEME["panel"], fg=THEME["fg"])
         menu.add_command(label="Copy BSSID", command=lambda: self._copy_to_clipboard(bssid))
         menu.add_command(label="Copy ESSID", command=lambda: self._copy_to_clipboard(essid))
-        menu.add_command(label="Lock Target", command=lambda: self._lock_target_from_bssid(bssid))
+        menu.add_command(label="Lock Target", command=lambda: self._lock_target(bssid))
         menu.post(event.x_root, event.y_root)
 
     def _copy_to_clipboard(self, text: str):
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
 
-    def _lock_target_from_bssid(self, bssid: str):
-        messagebox.showinfo("N2-ng", f"Target lock for {bssid} will be implemented in Task 6.")
+    def _lock_target(self, bssid: str):
+        net = self.networks.get(bssid)
+        if not net:
+            return
+        if not self.mon_iface:
+            messagebox.showwarning("N2-ng", "Start monitor mode first.")
+            return
+        self.locked_target = net
+        ch = net.get("channel", "1")
+        # Set system channel to prevent aireplay-ng mismatch
+        subprocess.run(["iw", "dev", self.mon_iface, "set", "channel", str(ch)], capture_output=True)
+        base = Path.home() / "hs" / "n2-ng" / sanitize_essid(net["essid"], bssid)
+        base.mkdir(parents=True, exist_ok=True)
+        prefix = str(base / f"capture_{time.strftime('%Y-%m-%d_%H-%M-%S')}")
+        self.worker.start_lock(self.mon_iface, int(ch), bssid, prefix)
+        self.channel_pill.config(text=f"LOCKED: CH {ch}", bg="green")
+        self._update_target_card(net)
+        self._log(f"Locked target {net['essid']} ({bssid}) on channel {ch}")
+        self._start_capture_size_monitor()
+
+    def _unlock_target(self):
+        self.locked_target = None
+        self.channel_pill.config(text="SCANNING ALL", bg="red")
+        self.target_label.config(text="No target locked")
+        self.size_label.config(text="Capture: 0 B")
+        self.client_tree.delete(*self.client_tree.get_children())
+        self.worker.stop()
+        if self.mon_iface:
+            self.worker.start_scan(self.mon_iface, self.current_band.get(), "/tmp/n2ng_scan")
+
+    def _update_target_card(self, net: dict):
+        lines = [
+            f"ESSID: {net.get('essid', '[Hidden]')}",
+            f"BSSID: {net['bssid']}",
+            f"Channel: {net.get('channel', '')}",
+            f"Power: {net.get('power', '')} dBm",
+            f"Privacy: {net.get('privacy', '')} / {net.get('cipher', '')} / {net.get('auth', '')}",
+        ]
+        self.target_label.config(text="\n".join(lines))
+
+    def _start_capture_size_monitor(self):
+        if not self.locked_target:
+            return
+        # Find the latest .cap in the target directory
+        base = Path.home() / "hs" / "n2-ng" / sanitize_essid(self.locked_target["essid"], self.locked_target["bssid"])
+        caps = sorted(base.glob("*.cap"))
+        if caps:
+            size = caps[-1].stat().st_size
+            self.size_label.config(text=f"Capture: {human_size(size)}")
+        if self.locked_target:
+            self.root.after(1000, self._start_capture_size_monitor)
 
     # ------------------------------------------------------------------
     # Queue / network updates
@@ -476,10 +576,22 @@ class N2NgApp:
             if event == "networks":
                 self._update_networks(payload)
             elif event == "clients":
-                self.clients = payload
+                self._update_clients(payload)
             elif event == "error":
                 self._log(f"ERROR: {payload}")
         self.poll_id = self.root.after(150, self._poll_queue)
+
+    def _update_clients(self, clients: list[dict]):
+        self.clients = clients
+        self.client_tree.delete(*self.client_tree.get_children())
+        if self.locked_target:
+            bssid = self.locked_target["bssid"]
+            for c in clients:
+                if c.get("bssid") == bssid or c.get("bssid") == "(not associated)":
+                    self.client_tree.insert(
+                        "", tk.END,
+                        values=(c.get("station", ""), c.get("power", ""), c.get("packets", ""), c.get("probed", "")),
+                    )
 
     def _update_networks(self, networks: list[dict]):
         # Keep existing entries so selections survive; update or insert
@@ -488,6 +600,10 @@ class N2NgApp:
         for net in networks:
             bssid = net["bssid"]
             seen.add(bssid)
+            old = self.networks.get(bssid)
+            # Hidden ESSID reveal detection
+            if old and old.get("essid") == "[Hidden]" and net.get("essid") and net.get("essid") != "[Hidden]":
+                self._log(f"Revealed hidden ESSID: {net['essid']} ({bssid})")
             values = (
                 net.get("power", ""), net.get("beacons", ""), net.get("iv", ""),
                 net.get("channel", ""), net.get("speed", ""), net.get("privacy", ""),
@@ -499,6 +615,11 @@ class N2NgApp:
             else:
                 self.tree.insert("", tk.END, iid=bssid, values=values, tags=(tag,))
             self.networks[bssid] = net
+            # Update locked target card/graph in real-time
+            if self.locked_target and self.locked_target["bssid"] == bssid:
+                self.locked_target = net
+                self._update_target_card(net)
+                self.signal_graph.add_sample(net.get("power", -100))
         # Remove stale
         for bssid in current - seen:
             self.tree.delete(bssid)
