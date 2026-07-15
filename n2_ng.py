@@ -554,6 +554,7 @@ class N2NgApp:
         self._build_ui()
         self._refresh_adapters()
         self._poll_queue()
+        self.root.after(100, self._check_dependencies)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         atexit.register(self._cleanup)
@@ -564,20 +565,21 @@ class N2NgApp:
     def _build_ui(self):
         self._build_toolbar()
 
-        main_frame = tk.Frame(self.root, bg=THEME["bg"])
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        content_frame = tk.Frame(self.root, bg=THEME["bg"])
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Left: network tree
-        left_frame = tk.Frame(main_frame, bg=THEME["bg"])
+        left_frame = tk.Frame(content_frame, bg=THEME["bg"])
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._build_network_tree(left_frame)
 
         # Right: detail panel
-        right_frame = tk.Frame(main_frame, bg=THEME["bg"], width=420)
+        right_frame = tk.Frame(content_frame, bg=THEME["bg"], width=420)
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
         right_frame.pack_propagate(False)
         self._build_right_panel(right_frame)
 
+        self._build_log_pane()
         self._build_status_bar()
 
     def _build_toolbar(self):
@@ -691,6 +693,16 @@ class N2NgApp:
         else:
             self.legacy_frame.pack_forget()
 
+    def _build_log_pane(self):
+        log_frame = tk.LabelFrame(self.root, text="Log", bg=THEME["panel"], fg=THEME["fg"], height=120)
+        log_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0, 5))
+        log_frame.pack_propagate(False)
+        self.log_text = tk.Text(log_frame, height=6, bg=THEME["bg"], fg=THEME["fg"], state=tk.DISABLED)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = tk.Scrollbar(log_frame, command=self.log_text.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.config(yscrollcommand=sb.set)
+
     def _build_status_bar(self):
         self.status = tk.Label(self.root, text="Ready", bg=THEME["panel"], fg=THEME["fg"], anchor=tk.W)
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
@@ -698,6 +710,24 @@ class N2NgApp:
     # ------------------------------------------------------------------
     # Event handling
     # ------------------------------------------------------------------
+    def _check_dependencies(self):
+        missing = DependencyChecker.check_all()
+        if missing:
+            names = ", ".join(missing)
+            msg = (
+                f"Missing optional/required tools: {names}\n\n"
+                "Install with:\n"
+                "sudo apt update && sudo apt install -y aircrack-ng iw hcxtools reaver wireshark-common pcapfix\n\n"
+                "Or build from source:\n"
+                "https://github.com/aircrack-ng/aircrack-ng\n"
+                "https://github.com/ZerBea/hcxtools\n"
+                "https://github.com/t6x/reaver-wps-fork-t6x"
+            )
+            self._log(f"Missing dependencies: {names}")
+            messagebox.showwarning("N2-ng Dependencies", msg)
+        else:
+            self._log("All dependencies satisfied")
+
     def _refresh_adapters(self):
         ifaces = self.airmon.list_physical_interfaces()
         menu = self.adapter_combo["menu"]
@@ -1091,7 +1121,14 @@ class N2NgApp:
         return "OPN"
 
     def _log(self, msg: str):
-        print(f"[N2-ng] {msg}")
+        ts = time.strftime("%H:%M:%S")
+        if hasattr(self, "log_text") and self.log_text.winfo_exists():
+            self.log_text.config(state=tk.NORMAL)
+            self.log_text.insert(tk.END, f"[{ts}] {msg}\n")
+            self.log_text.see(tk.END)
+            self.log_text.config(state=tk.DISABLED)
+        # Also mirror to stdout for debugging
+        print(f"[{ts}] {msg}")
 
     # ------------------------------------------------------------------
     # Cleanup
