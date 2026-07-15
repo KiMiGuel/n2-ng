@@ -131,3 +131,18 @@ def test_treeview_updates_in_place():
     assert app.tree.item(bssid, "values")[-2] == "After"
 
     root.destroy()
+
+
+def test_right_panel_is_scrollable():
+    """The right panel must live inside a canvas with a scrollbar."""
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+
+    assert hasattr(app, "right_canvas"), "missing right_canvas"
+    assert hasattr(app, "right_scrollbar"), "missing right_scrollbar"
+    assert hasattr(app, "right_inner_frame"), "missing right_inner_frame"
+    assert app.right_canvas.winfo_class() == "Canvas"
+    assert str(app.right_scrollbar.cget("orient")) == "vertical"
+
+    root.destroy()

@@ -895,14 +895,48 @@ class N2NgApp:
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._build_network_tree(left_frame)
 
-        # Right: detail panel
-        right_frame = tk.Frame(content_frame, bg=THEME["bg"], width=420)
-        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
-        right_frame.pack_propagate(False)
-        self._build_right_panel(right_frame)
+        # Right: notebook with Scan and Raw View tabs
+        self.notebook = ttk.Notebook(content_frame)
+        self.notebook.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False)
+        self.notebook.configure(width=420)
+
+        scan_tab = tk.Frame(self.notebook, bg=THEME["bg"])
+        self.notebook.add(scan_tab, text="Scan")
+        self._build_scrollable_right_panel(scan_tab)
+
+        raw_tab = tk.Frame(self.notebook, bg=THEME["bg"])
+        self.notebook.add(raw_tab, text="Raw View")
+        self._build_raw_view(raw_tab)
 
         self._build_log_pane()
         self._build_status_bar()
+
+    def _build_scrollable_right_panel(self, parent):
+        """Canvas + Scrollbar wrapper for the right-side detail panel."""
+        self.right_canvas = tk.Canvas(parent, bg=THEME["bg"], highlightthickness=0)
+        self.right_scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.right_canvas.yview)
+        self.right_canvas.configure(yscrollcommand=self.right_scrollbar.set)
+
+        self.right_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.right_inner_frame = tk.Frame(self.right_canvas, bg=THEME["bg"], width=420)
+        self.right_canvas_window = self.right_canvas.create_window((0, 0), window=self.right_inner_frame, anchor=tk.NW, width=420)
+
+        def _on_frame_configure(event=None):
+            self.right_canvas.configure(scrollregion=self.right_canvas.bbox("all"))
+
+        def _on_canvas_configure(event=None):
+            self.right_canvas.itemconfig(self.right_canvas_window, width=event.width)
+
+        self.right_inner_frame.bind("<Configure>", _on_frame_configure)
+        self.right_canvas.bind("<Configure>", _on_canvas_configure)
+
+        self._build_right_panel(self.right_inner_frame)
+
+    def _build_raw_view(self, parent):
+        """Stub: replaced in Task 3 with ANSI-colored airodump-ng output."""
+        self.raw_view = None
 
     def _build_toolbar(self):
         toolbar = tk.Frame(self.root, bg=THEME["panel"])
