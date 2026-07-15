@@ -6,6 +6,12 @@ Single-window Python/tkinter GUI for wireless capture on Kali Linux.
 
 ```bash
 cd /home/kali/n2-ng
+./n2-ng
+```
+
+Or directly:
+
+```bash
 python3 n2_ng.py
 ```
 
