@@ -674,6 +674,17 @@ class N2NgApp:
         tk.OptionMenu(interval_frame, self.deauth_interval_var, "10", "30", "60").pack(side=tk.LEFT)
         tk.Label(interval_frame, text="seconds", bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT)
 
+        # Capture history
+        hist_frame = tk.LabelFrame(parent, text="Capture History", bg=THEME["panel"], fg=THEME["fg"])
+        hist_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.history_list = tk.Listbox(hist_frame, bg=THEME["bg"], fg=THEME["fg"], selectmode=tk.EXTENDED)
+        self.history_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        hsb = tk.Scrollbar(hist_frame, command=self.history_list.yview)
+        hsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.history_list.config(yscrollcommand=hsb.set)
+        self.history_list.bind("<Button-3>", self._on_history_right_click)
+        tk.Button(hist_frame, text="Refresh", command=self._refresh_history, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.BOTTOM, fill=tk.X, pady=2)
+
     def _toggle_legacy(self):
         if self.legacy_visible.get():
             self.legacy_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -823,6 +834,7 @@ class N2NgApp:
         self._update_target_card(net)
         self._log(f"Locked target {net['essid']} ({bssid}) on channel {ch}")
         self._start_capture_size_monitor()
+        self._refresh_history()
 
     def _unlock_target(self):
         self.locked_target = None
@@ -942,6 +954,78 @@ class N2NgApp:
         self.status.config(text=f"{title}: {path}", bg="green", fg="black")
         self._log(f"{title}: {path}")
         messagebox.showinfo(title, f"{title}\n\nFile: {path}")
+        self._refresh_history()
+
+    def _refresh_history(self):
+        self.history_list.delete(0, tk.END)
+        base = Path.home() / "hs" / "n2-ng"
+        if not base.exists():
+            return
+        for cap in sorted(base.rglob("*.cap")):
+            self.history_list.insert(tk.END, str(cap))
+
+    def _on_history_right_click(self, event):
+        idx = self.history_list.nearest(event.y)
+        if idx < 0:
+            return
+        self.history_list.selection_clear(0, tk.END)
+        self.history_list.selection_set(idx)
+        cap_path = Path(self.history_list.get(idx))
+        menu = tk.Menu(self.root, tearoff=0, bg=THEME["panel"], fg=THEME["fg"])
+        menu.add_command(label="Copy hashcat command", command=lambda: self._copy_hashcat_cmd(cap_path))
+        menu.add_command(label="Copy .22000 content", command=lambda: self._copy_22000(cap_path))
+        menu.add_command(label="Fix capture", command=lambda: self._fix_capture(cap_path))
+        menu.add_command(label="Merge selected", command=self._merge_selected)
+        menu.post(event.x_root, event.y_root)
+
+    def _copy_hashcat_cmd(self, cap: Path):
+        hash22000 = cap.with_suffix(".22000")
+        if not hash22000.exists():
+            converted = self.capture_manager.convert(cap) if self.capture_manager else None
+            if not converted:
+                messagebox.showwarning("N2-ng", "No .22000 file found and conversion failed.")
+                return
+            hash22000 = converted
+        cmd = f"hashcat -m 22000 {hash22000} /usr/share/wordlists/rockyou.txt"
+        self._copy_to_clipboard(cmd)
+        self._log(f"Copied hashcat command for {cap.name}")
+
+    def _copy_22000(self, cap: Path):
+        hash22000 = cap.with_suffix(".22000")
+        if not hash22000.exists():
+            converted = self.capture_manager.convert(cap) if self.capture_manager else None
+            if not converted:
+                messagebox.showwarning("N2-ng", "No .22000 file found and conversion failed.")
+                return
+            hash22000 = converted
+        text = hash22000.read_text(errors="ignore")
+        self._copy_to_clipboard(text)
+        self._log(f"Copied .22000 content for {cap.name}")
+
+    def _fix_capture(self, cap: Path):
+        if not self.capture_manager:
+            return
+        fixed = self.capture_manager.fix(cap)
+        if fixed:
+            messagebox.showinfo("N2-ng", f"Fixed capture saved to:\n{fixed}")
+            self._log(f"Fixed {cap.name} -> {fixed.name}")
+            self._refresh_history()
+        else:
+            messagebox.showwarning("N2-ng", "pcapfix failed or not installed.")
+
+    def _merge_selected(self):
+        indices = self.history_list.curselection()
+        if len(indices) < 2:
+            messagebox.showwarning("N2-ng", "Select at least two captures to merge.")
+            return
+        caps = [Path(self.history_list.get(i)) for i in indices]
+        out = caps[0].with_suffix(".merged.cap")
+        if self.capture_manager and self.capture_manager.merge(caps, out):
+            messagebox.showinfo("N2-ng", f"Merged capture saved to:\n{out}")
+            self._log(f"Merged {len(caps)} captures -> {out.name}")
+            self._refresh_history()
+        else:
+            messagebox.showwarning("N2-ng", "mergecap failed or not installed.")
 
     def _update_clients(self, clients: list[dict]):
         self.clients = clients
