@@ -2,10 +2,12 @@
 import atexit
 import csv
 import io
+import json
 import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -29,6 +31,19 @@ THEME = {
 
 def format_bssid(bssid: str) -> str:
     return bssid.upper().strip()
+
+
+def _airodump_supports(flag: str) -> bool:
+    """Return True if the installed airodump-ng supports ``flag``.
+
+    The help text format varies across aircrack-ng versions; we look for the
+    flag literally in the help output so unsupported flags don't crash the scan.
+    """
+    try:
+        out = subprocess.check_output(["airodump-ng", "--help"], text=True, stderr=subprocess.STDOUT)
+        return flag in out
+    except Exception:
+        return False
 
 
 def sanitize_essid(essid: str, bssid: str) -> str:
@@ -105,10 +120,40 @@ class DependencyChecker:
 
 
 class AirmonManager:
-    """Detect wireless adapters and manage airmon-ng monitor mode."""
+    """Detect wireless adapters and manage monitor mode dynamically."""
 
     def __init__(self):
-        self._started: list[str] = []
+        # Maps original interface -> detected monitor interface
+        self._mon_map: dict[str, str] = {}
+
+    @staticmethod
+    def _list_interfaces() -> set[str]:
+        ifaces = set()
+        try:
+            out = subprocess.check_output(["ip", "link"], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                m = re.search(r"^(?:\d+:\s+)?(\S+):", line)
+                if m and m.group(1) != "lo":
+                    ifaces.add(m.group(1))
+        except Exception:
+            pass
+        return ifaces
+
+    @staticmethod
+    def _iface_mode(iface: str) -> str | None:
+        try:
+            out = subprocess.check_output(["iw", "dev", iface, "info"], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                m = re.search(r"type\s+(\w+)", line)
+                if m:
+                    return m.group(1).lower()
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _is_monitor(iface: str) -> bool:
+        return AirmonManager._iface_mode(iface) == "monitor"
 
     def list_physical_interfaces(self) -> list[str]:
         result = []
@@ -124,7 +169,7 @@ class AirmonManager:
         try:
             out = subprocess.check_output(["ip", "link"], text=True, stderr=subprocess.DEVNULL)
             for line in out.splitlines():
-                m = re.search(r"^(?:\\d+:\\s+)?([ew]lan\\d+|wlp\\S+?):", line)
+                m = re.search(r"^(?:\d+:\s+)?([ew]lan\d+|wlp\S+?):", line)
                 if m:
                     name = m.group(1)
                     if name not in result and not name.endswith("mon"):
@@ -133,22 +178,59 @@ class AirmonManager:
             pass
         return sorted(result)
 
+    def _manual_monitor(self, iface: str) -> bool:
+        try:
+            subprocess.run(["ip", "link", "set", iface, "down"], check=True, capture_output=True)
+            subprocess.run(["iw", "dev", iface, "set", "type", "monitor"], check=True, capture_output=True)
+            subprocess.run(["ip", "link", "set", iface, "up"], check=True, capture_output=True)
+            return self._is_monitor(iface)
+        except Exception:
+            return False
+
     def start_monitor(self, iface: str) -> str:
+        # Stop any previous monitor for this iface
         self.stop_monitor_for_iface(iface)
-        subprocess.run(["airmon-ng", "start", iface], check=True, capture_output=True, text=True)
-        self._started.append(iface)
-        candidates = [f"{iface}mon", "wlan0mon", "wlan1mon", "wlan2mon"]
-        for c in candidates:
-            if self._iface_exists(c):
-                return c
-        for line in subprocess.check_output(["ip", "link"], text=True).splitlines():
-            m = re.search(r"^(?:\\d+:\\s+)?(\\S+mon):", line)
-            if m:
-                return m.group(1)
+        before = self._list_interfaces()
+        try:
+            subprocess.run(["airmon-ng", "start", iface], check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError:
+            # airmon-ng failed; try manual iw sequence
+            if self._manual_monitor(iface):
+                self._mon_map[iface] = iface
+                return iface
+            raise RuntimeError(f"airmon-ng and manual iw both failed for {iface}")
+
+        after = self._list_interfaces()
+        new_ifaces = after - before
+        # Prefer new interfaces that are monitor mode
+        for cand in new_ifaces:
+            if self._is_monitor(cand):
+                self._mon_map[iface] = cand
+                return cand
+        # If no new interface, original may have been converted
+        if self._is_monitor(iface):
+            self._mon_map[iface] = iface
+            return iface
+        # Fallback: any existing monitor interface
+        for cand in after:
+            if self._is_monitor(cand):
+                self._mon_map[iface] = cand
+                return cand
         raise RuntimeError(f"Could not determine monitor interface for {iface}")
 
     def stop_monitor_for_iface(self, iface: str) -> None:
-        subprocess.run(["airmon-ng", "stop", f"{iface}mon"], capture_output=True, text=True)
+        mon = self._mon_map.pop(iface, None)
+        if mon and mon != iface:
+            subprocess.run(["airmon-ng", "stop", mon], capture_output=True, text=True)
+        elif mon == iface:
+            # Original iface was converted; set back to managed
+            try:
+                subprocess.run(["ip", "link", "set", iface, "down"], check=True, capture_output=True)
+                subprocess.run(["iw", "dev", iface, "set", "type", "managed"], check=True, capture_output=True)
+                subprocess.run(["ip", "link", "set", iface, "up"], check=True, capture_output=True)
+            except Exception:
+                pass
+        # Also try airmon-ng stop on original name as safety net
         subprocess.run(["airmon-ng", "stop", iface], capture_output=True, text=True)
 
     def stop_monitor(self, mon_iface: str) -> None:
@@ -156,9 +238,8 @@ class AirmonManager:
             subprocess.run(["airmon-ng", "stop", mon_iface], capture_output=True, text=True)
 
     def cleanup(self) -> None:
-        for iface in self._started:
+        for iface in list(self._mon_map.keys()):
             self.stop_monitor_for_iface(iface)
-        self._started.clear()
 
     @staticmethod
     def _iface_exists(name: str) -> bool:
@@ -202,6 +283,7 @@ def parse_airodump_csv(text: str):
             "beacons": row.get("# Beacons", "").strip(),
             "iv": row.get("# IV", "").strip(),
             "id_len": row.get("ID-length", "").strip(),
+            "manufacturer": row.get("Manufacturer", "").strip(),
             "essid": essid,
         })
     if len(sections) > 1:
@@ -220,58 +302,139 @@ def parse_airodump_csv(text: str):
     return networks, clients
 
 
+class Settings:
+    """Persistent airodump-ng settings stored in ~/.config/n2-ng/settings.json."""
+
+    DEFAULTS = {
+        "color_output": False,
+        "sort_by": "PWR",
+        "realtime_sort": False,
+        "write_interval": 1,
+        "output_formats": ["csv", "cap"],
+        "show_manufacturers": False,
+        "filter_encryption": "All",
+        "quiet_mode": False,
+    }
+
+    def __init__(self):
+        self.path = user_home() / ".config" / "n2-ng" / "settings.json"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.data = dict(self.DEFAULTS)
+        self.load()
+
+    def load(self):
+        if self.path.exists():
+            try:
+                self.data.update(json.loads(self.path.read_text()))
+            except Exception:
+                pass
+
+    def save(self):
+        try:
+            self.path.write_text(json.dumps(self.data, indent=2))
+        except Exception as e:
+            print(f"Failed to save settings: {e}")
+
+    def get(self, key):
+        return self.data.get(key, self.DEFAULTS.get(key))
+
+    def set(self, key, value):
+        self.data[key] = value
+
+
 class AirodumpWorker(threading.Thread):
     """Run airodump-ng and parse its CSV output."""
 
-    def __init__(self, event_queue: queue.Queue):
+    def __init__(self, event_queue: queue.Queue, settings: Settings):
         super().__init__(daemon=True)
         self.queue = event_queue
+        self.settings = settings
         self._proc = None
         self._prefix = "/tmp/n2ng_scan"
         self._running = threading.Event()
+        self._paused = threading.Event()
+        self._last_cmd = None
+        self._last_mon_iface = None
+        self._last_band = None
+        self._last_channel = None
+        self._last_bssid = None
+
+    def _build_base_cmd(self, prefix: str) -> list[str]:
+        fmt = ",".join(self.settings.get("output_formats"))
+        cmd = [
+            "airodump-ng",
+            "--write-interval", str(self.settings.get("write_interval")),
+            "-w", prefix,
+            "--output-format", fmt,
+        ]
+        # Only pass flags the installed airodump-ng understands.
+        if _airodump_supports("--color"):
+            if self.settings.get("color_output"):
+                cmd.append("--color")
+            else:
+                cmd.extend(["--color", "0"])
+        if self.settings.get("quiet_mode") and _airodump_supports("-q"):
+            cmd.append("-q")
+        if self.settings.get("show_manufacturers"):
+            cmd.append("-M")
+        return cmd
 
     def start_scan(self, mon_iface: str, band: str, prefix: str):
         self.stop()
         self._prefix = prefix
+        self._last_mon_iface = mon_iface
+        self._last_band = band
         band_arg = {"2.4GHz": "bg", "5GHz": "a", "Both": "abg"}.get(band, "abg")
-        cmd = [
-            "airodump-ng",
-            "--write-interval", "1",
-            "-w", prefix,
-            "--output-format", "csv",
-            "--band", band_arg,
-            mon_iface,
-        ]
+        cmd = self._build_base_cmd(prefix)
+        cmd.extend(["--band", band_arg, mon_iface])
+        self._last_cmd = cmd
         self._running.set()
-        self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        self._paused.clear()
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if not self.is_alive():
             self.start()
 
     def start_lock(self, mon_iface: str, channel: int, bssid: str, prefix: str):
         self.stop()
         self._prefix = prefix
-        cmd = [
-            "airodump-ng",
-            "-c", str(channel),
-            "--bssid", bssid,
-            "--write-interval", "1",
-            "-w", prefix,
-            "--output-format", "csv",
-            mon_iface,
-        ]
+        self._last_mon_iface = mon_iface
+        self._last_channel = channel
+        self._last_bssid = bssid
+        cmd = self._build_base_cmd(prefix)
+        cmd.extend(["-c", str(channel), "--bssid", bssid, mon_iface])
+        self._last_cmd = cmd
         self._running.set()
-        self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        self._paused.clear()
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if not self.is_alive():
             self.start()
+
+    def restart_with_settings(self):
+        """Restart the current scan/lock with updated settings."""
+        if self._last_mon_iface and self._last_band:
+            self.start_scan(self._last_mon_iface, self._last_band, self._prefix)
+        elif self._last_mon_iface and self._last_channel and self._last_bssid:
+            self.start_lock(self._last_mon_iface, self._last_channel, self._last_bssid, self._prefix)
+
+    def pause(self):
+        if self._proc and not self._paused.is_set():
+            self._proc.send_signal(signal.SIGSTOP)
+            self._paused.set()
+
+    def resume(self):
+        if self._proc and self._paused.is_set():
+            self._proc.send_signal(signal.SIGCONT)
+            self._paused.clear()
+
+    def is_paused(self) -> bool:
+        return self._paused.is_set()
 
     def stop(self):
         self._running.clear()
         if self._proc:
             try:
+                if self._paused.is_set():
+                    self._proc.send_signal(signal.SIGCONT)
                 self._proc.terminate()
                 self._proc.wait(timeout=2)
             except Exception:
@@ -280,12 +443,13 @@ class AirodumpWorker(threading.Thread):
                 except Exception:
                     pass
             self._proc = None
+        self._paused.clear()
 
     def run(self):
         csv_path = Path(f"{self._prefix}-01.csv")
         last_mtime = 0
         while self._running.is_set():
-            if csv_path.exists():
+            if not self._paused.is_set() and csv_path.exists():
                 mtime = csv_path.stat().st_mtime
                 if mtime != last_mtime:
                     last_mtime = mtime
@@ -539,6 +703,94 @@ class WpsScanner(threading.Thread):
                     pass
 
 
+class SettingsDialog(tk.Toplevel):
+    """Modal dialog for airodump-ng settings."""
+
+    SORT_OPTIONS = ["PWR", "Beacons", "#Data", "CH", "ESSID", "BSSID"]
+    FILTER_OPTIONS = ["All", "WEP only", "WPA/WPA2 only", "WPA3 only", "Open only"]
+    FORMAT_OPTIONS = ["csv", "cap", "kismet", "pcap"]
+
+    def __init__(self, parent, settings: Settings, apply_callback):
+        super().__init__(parent)
+        self.title("Airodump Settings")
+        self.configure(bg=THEME["bg"])
+        self.resizable(False, False)
+        self.settings = settings
+        self.apply_callback = apply_callback
+        self._build()
+        self.transient(parent)
+        self.grab_set()
+
+    def _build(self):
+        frame = tk.Frame(self, bg=THEME["bg"])
+        frame.pack(padx=10, pady=10)
+
+        # Color output
+        self.color_var = tk.BooleanVar(value=self.settings.get("color_output"))
+        tk.Checkbutton(frame, text="Color output (airodump-ng --color)", variable=self.color_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=0, column=0, sticky=tk.W, columnspan=2)
+
+        # Quiet mode
+        self.quiet_var = tk.BooleanVar(value=self.settings.get("quiet_mode"))
+        tk.Checkbutton(frame, text="Quiet mode (-q)", variable=self.quiet_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=1, column=0, sticky=tk.W, columnspan=2)
+
+        # Realtime sort
+        self.realtime_var = tk.BooleanVar(value=self.settings.get("realtime_sort"))
+        tk.Checkbutton(frame, text="Realtime sort (interactive 'r')", variable=self.realtime_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=2, column=0, sticky=tk.W, columnspan=2)
+
+        # Show manufacturers
+        self.mfg_var = tk.BooleanVar(value=self.settings.get("show_manufacturers"))
+        tk.Checkbutton(frame, text="Show manufacturers (-M)", variable=self.mfg_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=3, column=0, sticky=tk.W, columnspan=2)
+
+        # Sort by
+        tk.Label(frame, text="Sort by:", bg=THEME["bg"], fg=THEME["fg"]).grid(row=4, column=0, sticky=tk.W)
+        self.sort_var = tk.StringVar(value=self.settings.get("sort_by"))
+        tk.OptionMenu(frame, self.sort_var, *self.SORT_OPTIONS).grid(row=4, column=1, sticky=tk.W)
+
+        # Filter encryption
+        tk.Label(frame, text="Filter encryption:", bg=THEME["bg"], fg=THEME["fg"]).grid(row=5, column=0, sticky=tk.W)
+        self.filter_var = tk.StringVar(value=self.settings.get("filter_encryption"))
+        tk.OptionMenu(frame, self.filter_var, *self.FILTER_OPTIONS).grid(row=5, column=1, sticky=tk.W)
+
+        # Write interval
+        tk.Label(frame, text="Write interval (s):", bg=THEME["bg"], fg=THEME["fg"]).grid(row=6, column=0, sticky=tk.W)
+        self.interval_var = tk.IntVar(value=self.settings.get("write_interval"))
+        tk.Spinbox(frame, from_=1, to=60, textvariable=self.interval_var, width=5).grid(row=6, column=1, sticky=tk.W)
+
+        # Output formats
+        tk.Label(frame, text="Output formats:", bg=THEME["bg"], fg=THEME["fg"]).grid(row=7, column=0, sticky=tk.W)
+        fmt_frame = tk.Frame(frame, bg=THEME["bg"])
+        fmt_frame.grid(row=7, column=1, sticky=tk.W)
+        self.format_vars = {}
+        for i, fmt in enumerate(self.FORMAT_OPTIONS):
+            var = tk.BooleanVar(value=fmt in self.settings.get("output_formats"))
+            self.format_vars[fmt] = var
+            tk.Checkbutton(fmt_frame, text=fmt, variable=var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).pack(side=tk.LEFT)
+
+        # Buttons
+        btn_frame = tk.Frame(self, bg=THEME["bg"])
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="Apply", command=self._apply, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Cancel", command=self.destroy, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+
+    def _apply(self):
+        self.settings.set("color_output", self.color_var.get())
+        self.settings.set("quiet_mode", self.quiet_var.get())
+        self.settings.set("realtime_sort", self.realtime_var.get())
+        self.settings.set("show_manufacturers", self.mfg_var.get())
+        self.settings.set("sort_by", self.sort_var.get())
+        self.settings.set("filter_encryption", self.filter_var.get())
+        self.settings.set("write_interval", self.interval_var.get())
+        formats = [fmt for fmt, var in self.format_vars.items() if var.get()]
+        if "csv" not in formats:
+            formats.insert(0, "csv")
+        if "cap" not in formats:
+            formats.append("cap")
+        self.settings.set("output_formats", formats)
+        self.settings.save()
+        self.apply_callback()
+        self.destroy()
+
+
 class N2NgApp:
     """Main tkinter application."""
 
@@ -550,8 +802,9 @@ class N2NgApp:
         self.root.configure(bg=THEME["bg"])
 
         self.queue = queue.Queue()
+        self.settings = Settings()
         self.airmon = AirmonManager()
-        self.worker = AirodumpWorker(self.queue)
+        self.worker = AirodumpWorker(self.queue, self.settings)
         self.capture_manager = CaptureManager(self.queue, self._log)
         self.attack = AttackController(self._log)
 
@@ -562,6 +815,7 @@ class N2NgApp:
         self.current_band = tk.StringVar(value="Both")
         self.adapter_var = tk.StringVar()
         self.poll_id = None
+        self._paused = False
 
         self._build_ui()
         self._refresh_adapters()
@@ -614,23 +868,36 @@ class N2NgApp:
         tk.Button(toolbar, text="Stop Monitor", command=self._stop_monitor, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
         tk.Button(toolbar, text="WPS Scan", command=self._wps_scan, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
         tk.Button(toolbar, text="Refresh Adapters", command=self._refresh_adapters, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="Settings", command=self._open_settings, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        self.pause_btn = tk.Button(toolbar, text="Pause Scan", command=self._toggle_pause, bg=THEME["panel"], fg=THEME["fg"])
+        self.pause_btn.pack(side=tk.LEFT, padx=5)
 
         self.channel_pill = tk.Label(toolbar, text="SCANNING ALL", bg="red", fg="white", font=("TkDefaultFont", 10, "bold"))
         self.channel_pill.pack(side=tk.RIGHT, padx=10)
 
     def _build_network_tree(self, parent):
-        cols = ("pwr", "beacons", "data", "ch", "mb", "enc", "cipher", "auth", "essid", "bssid")
+        if self.settings.get("show_manufacturers"):
+            cols = ("pwr", "beacons", "data", "ch", "mb", "enc", "cipher", "auth", "mfg", "essid", "bssid")
+            headings = {
+                "pwr": "PWR", "beacons": "Beacons", "data": "#Data", "ch": "CH",
+                "mb": "MB", "enc": "ENC", "cipher": "CIPHER", "auth": "AUTH",
+                "mfg": "Manufacturer", "essid": "ESSID", "bssid": "BSSID",
+            }
+        else:
+            cols = ("pwr", "beacons", "data", "ch", "mb", "enc", "cipher", "auth", "essid", "bssid")
+            headings = {
+                "pwr": "PWR", "beacons": "Beacons", "data": "#Data", "ch": "CH",
+                "mb": "MB", "enc": "ENC", "cipher": "CIPHER", "auth": "AUTH",
+                "essid": "ESSID", "bssid": "BSSID",
+            }
         self.tree = ttk.Treeview(parent, columns=cols, show="headings", selectmode="browse")
-        headings = {
-            "pwr": "PWR", "beacons": "Beacons", "data": "#Data", "ch": "CH",
-            "mb": "MB", "enc": "ENC", "cipher": "CIPHER", "auth": "AUTH",
-            "essid": "ESSID", "bssid": "BSSID",
-        }
         for c in cols:
             self.tree.heading(c, text=headings[c])
             self.tree.column(c, width=80, anchor=tk.CENTER)
         self.tree.column("essid", width=150)
         self.tree.column("bssid", width=130)
+        if self.settings.get("show_manufacturers"):
+            self.tree.column("mfg", width=120)
 
         vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.tree.yview)
         hsb = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=self.tree.xview)
@@ -758,6 +1025,7 @@ class N2NgApp:
         try:
             self.mon_iface = self.airmon.start_monitor(iface)
             self.status.config(text=f"Monitor: {self.mon_iface}")
+            self.pause_btn.config(text="Pause Scan")
             self.worker.start_scan(self.mon_iface, self.current_band.get(), "/tmp/n2ng_scan")
         except Exception as e:
             messagebox.showerror("N2-ng", f"Failed to start monitor mode: {e}")
@@ -769,6 +1037,7 @@ class N2NgApp:
             self.mon_iface = None
         self.status.config(text="Monitor stopped")
         self.channel_pill.config(text="SCANNING ALL", bg="red")
+        self.pause_btn.config(text="Pause Scan")
 
     def _wps_scan(self):
         if not self.mon_iface:
@@ -807,6 +1076,43 @@ class N2NgApp:
             self.wps_scanner.stop()
         if hasattr(self, "wps_dialog") and self.wps_dialog.winfo_exists():
             self.wps_dialog.destroy()
+
+    def _open_settings(self):
+        SettingsDialog(self.root, self.settings, self._apply_settings)
+
+    def _apply_settings(self):
+        self._log("Settings applied")
+        # Rebuild tree if manufacturer column visibility changed
+        self._rebuild_tree_if_needed()
+        # Refresh tree to apply sort/filter
+        self._refresh_tree()
+        # Restart airodump if running so new flags take effect
+        if self.worker._last_cmd and self.mon_iface:
+            self.worker.restart_with_settings()
+            self._log("Restarted airodump-ng with new settings")
+
+    def _rebuild_tree_if_needed(self):
+        # Determine if manufacturer column state changed
+        has_mfg = self.settings.get("show_manufacturers")
+        current_cols = self.tree["columns"]
+        has_mfg_col = "mfg" in current_cols
+        if has_mfg != has_mfg_col:
+            # Rebuild treeview
+            parent = self.tree.master
+            self.tree.destroy()
+            self._build_network_tree(parent)
+
+    def _toggle_pause(self):
+        if not self.worker._proc:
+            return
+        if self.worker.is_paused():
+            self.worker.resume()
+            self.pause_btn.config(text="Pause Scan")
+            self._log("Scan resumed")
+        else:
+            self.worker.pause()
+            self.pause_btn.config(text="Resume Scan")
+            self._log("Scan paused")
 
     def _toggle_auto_deauth(self):
         if self.auto_deauth_var.get():
@@ -922,7 +1228,7 @@ class N2NgApp:
     def _our_mac(self) -> str | None:
         try:
             out = subprocess.check_output(["ip", "link", "show", self.mon_iface], text=True, stderr=subprocess.DEVNULL)
-            m = re.search(r"link/ether\\s+([0-9a-f:]{17})", out)
+            m = re.search(r"link/ether\s+([0-9a-f:]{17})", out)
             if m:
                 return m.group(1).upper()
         except Exception:
@@ -1082,36 +1388,92 @@ class N2NgApp:
                     )
 
     def _update_networks(self, networks: list[dict]):
-        # Keep existing entries so selections survive; update or insert
-        current = set(self.tree.get_children())
-        seen = set()
         for net in networks:
             bssid = net["bssid"]
-            seen.add(bssid)
             old = self.networks.get(bssid)
-            # Hidden ESSID reveal detection
             if old and old.get("essid") == "[Hidden]" and net.get("essid") and net.get("essid") != "[Hidden]":
                 self._log(f"Revealed hidden ESSID: {net['essid']} ({bssid})")
-            values = (
-                net.get("power", ""), net.get("beacons", ""), net.get("iv", ""),
-                net.get("channel", ""), net.get("speed", ""), net.get("privacy", ""),
-                net.get("cipher", ""), net.get("auth", ""), net.get("essid", ""), bssid,
-            )
-            tag = self._privacy_tag(net.get("privacy", ""))
-            if bssid in self.networks:
-                self.tree.item(bssid, values=values, tags=(tag,))
-            else:
-                self.tree.insert("", tk.END, iid=bssid, values=values, tags=(tag,))
             self.networks[bssid] = net
-            # Update locked target card/graph in real-time
             if self.locked_target and self.locked_target["bssid"] == bssid:
                 self.locked_target = net
                 self._update_target_card(net)
                 self.signal_graph.add_sample(net.get("power", -100))
-        # Remove stale
-        for bssid in current - seen:
-            self.tree.delete(bssid)
-            self.networks.pop(bssid, None)
+        self._refresh_tree()
+
+    def _filter_networks(self, networks: list[dict]) -> list[dict]:
+        filt = self.settings.get("filter_encryption")
+        if filt == "All":
+            return networks
+        result = []
+        for net in networks:
+            p = net.get("privacy", "").upper()
+            if filt == "WEP only" and "WEP" in p:
+                result.append(net)
+            elif filt == "WPA/WPA2 only" and ("WPA" in p or "WPA2" in p) and "WPA3" not in p:
+                result.append(net)
+            elif filt == "WPA3 only" and "WPA3" in p:
+                result.append(net)
+            elif filt == "Open only" and (not p or p == "OPN"):
+                result.append(net)
+        return result
+
+    def _sort_networks(self, networks: list[dict]) -> list[dict]:
+        sort_key = self.settings.get("sort_by")
+        key_map = {
+            "PWR": "power",
+            "Beacons": "beacons",
+            "#Data": "iv",
+            "CH": "channel",
+            "ESSID": "essid",
+            "BSSID": "bssid",
+        }
+        col = key_map.get(sort_key, "power")
+        reverse = True
+        if col in ("essid", "bssid"):
+            reverse = False
+
+        def sort_val(net):
+            raw = net.get(col, "")
+            if col in ("power", "beacons", "iv", "channel"):
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    return -9999
+            return str(raw).lower()
+
+        return sorted(networks, key=sort_val, reverse=reverse)
+
+    def _network_values(self, net: dict) -> tuple:
+        if self.settings.get("show_manufacturers"):
+            return (
+                net.get("power", ""), net.get("beacons", ""), net.get("iv", ""),
+                net.get("channel", ""), net.get("speed", ""), net.get("privacy", ""),
+                net.get("cipher", ""), net.get("auth", ""), net.get("manufacturer", ""),
+                net.get("essid", ""), net["bssid"],
+            )
+        return (
+            net.get("power", ""), net.get("beacons", ""), net.get("iv", ""),
+            net.get("channel", ""), net.get("speed", ""), net.get("privacy", ""),
+            net.get("cipher", ""), net.get("auth", ""), net.get("essid", ""), net["bssid"],
+        )
+
+    def _refresh_tree(self):
+        # Remember selection
+        selected = set(self.tree.selection())
+        # Clear and rebuild
+        self.tree.delete(*self.tree.get_children())
+        networks = list(self.networks.values())
+        networks = self._filter_networks(networks)
+        networks = self._sort_networks(networks)
+        for net in networks:
+            bssid = net["bssid"]
+            values = self._network_values(net)
+            tag = self._privacy_tag(net.get("privacy", ""))
+            self.tree.insert("", tk.END, iid=bssid, values=values, tags=(tag,))
+        # Restore selection if item still exists
+        for bssid in selected:
+            if self.tree.exists(bssid):
+                self.tree.selection_add(bssid)
         # Color config
         self.tree.tag_configure("OPN", foreground="#00ff41")
         self.tree.tag_configure("WEP", foreground="#ff4444")
