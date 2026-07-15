@@ -92,6 +92,67 @@ class DependencyChecker:
         return missing
 
 
+class AirmonManager:
+    """Detect wireless adapters and manage airmon-ng monitor mode."""
+
+    def __init__(self):
+        self._started: list[str] = []
+
+    def list_physical_interfaces(self) -> list[str]:
+        result = []
+        try:
+            out = subprocess.check_output(["airmon-ng"], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines()[2:]:
+                parts = line.split()
+                # airmon-ng layout: phyN <iface> <driver> <chipset>
+                if len(parts) >= 2 and parts[1].startswith(("wlan", "wlp")):
+                    result.append(parts[1])
+        except Exception:
+            pass
+        try:
+            out = subprocess.check_output(["ip", "link"], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                m = re.search(r"^(?:\\d+:\\s+)?([ew]lan\\d+|wlp\\S+?):", line)
+                if m:
+                    name = m.group(1)
+                    if name not in result:
+                        result.append(name)
+        except Exception:
+            pass
+        return sorted(result)
+
+    def start_monitor(self, iface: str) -> str:
+        self.stop_monitor_for_iface(iface)
+        subprocess.run(["airmon-ng", "start", iface], check=True, capture_output=True, text=True)
+        self._started.append(iface)
+        candidates = [f"{iface}mon", "wlan0mon", "wlan1mon", "wlan2mon"]
+        for c in candidates:
+            if self._iface_exists(c):
+                return c
+        for line in subprocess.check_output(["ip", "link"], text=True).splitlines():
+            m = re.search(r"^(?:\\d+:\\s+)?(\\S+mon):", line)
+            if m:
+                return m.group(1)
+        raise RuntimeError(f"Could not determine monitor interface for {iface}")
+
+    def stop_monitor_for_iface(self, iface: str) -> None:
+        subprocess.run(["airmon-ng", "stop", f"{iface}mon"], capture_output=True, text=True)
+        subprocess.run(["airmon-ng", "stop", iface], capture_output=True, text=True)
+
+    def stop_monitor(self, mon_iface: str) -> None:
+        if mon_iface:
+            subprocess.run(["airmon-ng", "stop", mon_iface], capture_output=True, text=True)
+
+    def cleanup(self) -> None:
+        for iface in self._started:
+            self.stop_monitor_for_iface(iface)
+        self._started.clear()
+
+    @staticmethod
+    def _iface_exists(name: str) -> bool:
+        return Path(f"/sys/class/net/{name}").exists()
+
+
 def ensure_root():
     if os.geteuid() == 0:
         return
