@@ -1,0 +1,11 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: n2-ng
+Source: https://github.com/KiMiGuel/n2-ng
+
+Files: *
+Copyright: 2026 KiMiGuEL — INDEPENTEST
+License: GPL-3.0
+ This package is licensed under the GNU General Public License version 3.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in /usr/share/common-licenses/GPL-3.

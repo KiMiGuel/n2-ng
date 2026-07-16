@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+  <rect width="1280" height="720" fill="#0b0b0b"/>
+  <rect x="40" y="40" width="1200" height="640" fill="#111" stroke="#00ff41" stroke-width="3"/>
+  <text x="640" y="350" fill="#00ff41" font-family="monospace" font-size="42" text-anchor="middle">N2-NG Screenshot Placeholder</text>
+  <text x="640" y="410" fill="#00ccff" font-family="monospace" font-size="24" text-anchor="middle">Replace with live GUI capture before release</text>
+</svg>

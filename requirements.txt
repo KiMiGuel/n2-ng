@@ -1,2 +1,1 @@
-# N2-ng uses only Python standard library (tkinter).
-# System dependencies are checked by install.sh.
+scapy

@@ -1,0 +1,14 @@
+Source: n2-ng
+Section: net
+Priority: optional
+Maintainer: KiMiGuEL — INDEPENTEST <Indepentest@gmail.com>
+Build-Depends: debhelper (>= 13), dh-python, python3, python3-setuptools
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: n2-ng
+Architecture: all
+Depends: ${python3:Depends}, ${misc:Depends}, python3, python3-tk, aircrack-ng, wireless-tools
+Description: Single-window GUI for the aircrack-ng suite
+ N2-NG wraps airmon-ng, airodump-ng, and aireplay-ng in a single
+ tkinter interface for WiFi pentesting workflows.

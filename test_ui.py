@@ -1,22 +1,269 @@
-import importlib.util
 import os
 import sys
 import threading
 import time
+import types
+from pathlib import Path
+from unittest.mock import Mock
 
 # Avoid running ensure_root / Tk mainloop when importing the module.
 sys.modules["__main__"] = sys.modules["__main__"]
 
-_spec = importlib.util.spec_from_file_location(
-    "n2ng", os.path.join(os.path.dirname(__file__), "n2_ng.py")
-)
-_n2ng = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_n2ng)
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+import n2ng.main as _n2ng
 
 import tkinter as tk
 from tkinter import ttk
 
 THEME = _n2ng.THEME
+
+
+def test_gui_only_settings_apply_does_not_restart_scan():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.worker.restart_with_settings = Mock(return_value=(True, None))
+    app.settings.save = Mock(return_value=(True, None))
+    proposed = dict(app.settings.data, sort_by="ESSID", filter_encryption="Open only")
+
+    assert app._apply_settings(proposed, app.worker.is_paused()) == (True, None)
+    app.worker.restart_with_settings.assert_not_called()
+    assert app.settings.get("sort_by") == "ESSID"
+    root.destroy()
+
+
+def test_restart_failure_restores_settings_and_status():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.worker.is_running = Mock(return_value=True)
+    app.worker.restart_with_settings = Mock(return_value=(False, "launch failed"))
+    app.settings.save = Mock(return_value=(True, None))
+    previous = dict(app.settings.data)
+    proposed = dict(previous, write_interval=5)
+
+    assert app._apply_settings(proposed, False) == (False, "launch failed")
+    assert app.settings.data == previous
+    assert "launch failed" in app.status.cget("text")
+    root.destroy()
+
+
+def test_quiet_mode_apply_restarts_running_scan():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.worker.is_running = Mock(return_value=True)
+    app.worker.restart_with_settings = Mock(return_value=(True, None))
+    app.settings.save = Mock(return_value=(True, None))
+    proposed = dict(app.settings.data, quiet_mode=not app.settings.get("quiet_mode"))
+
+    assert app._apply_settings(proposed, False) == (True, None)
+
+    app.worker.restart_with_settings.assert_called_once()
+    root.destroy()
+
+
+def test_settings_dialog_constructs_with_pause_state():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+
+    dialog = _n2ng.SettingsDialog(root, app.settings, app._apply_settings)
+
+    assert dialog.pause_var.get() is app.worker.is_paused()
+    dialog.destroy()
+    root.destroy()
+
+
+def test_toolbar_selectors_use_readonly_comboboxes():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+
+    assert app.adapter_combo.winfo_class() == "TCombobox"
+    assert app.band_combo.winfo_class() == "TCombobox"
+    assert str(app.adapter_combo.cget("state")) == "readonly"
+    assert str(app.band_combo.cget("state")) == "readonly"
+    root.destroy()
+
+
+def test_stop_scan_clears_tree_and_disables_pause():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.worker.stop = Mock()
+    bssid = "AA:BB:CC:DD:EE:FF"
+    app.networks[bssid] = {
+        "bssid": bssid,
+        "essid": "Net",
+        "power": "-50",
+        "beacons": "10",
+        "iv": "0",
+        "channel": "6",
+        "speed": "54",
+        "privacy": "WPA2",
+        "cipher": "CCMP",
+        "auth": "PSK",
+        "manufacturer": "",
+    }
+    app._refresh_tree()
+    app.pause_btn.config(state=tk.NORMAL, text="Resume Scan")
+
+    app._stop_scan()
+
+    app.worker.stop.assert_called_once()
+    assert app.networks == {}
+    assert app.tree.get_children() == ()
+    assert app.status.cget("text") == "Scan stopped"
+    assert str(app.pause_btn.cget("state")) == tk.DISABLED
+    assert app.pause_btn.cget("text") == "Pause Scan"
+    root.destroy()
+
+
+def test_spacebar_toggles_scan_pause():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.worker._proc = Mock()
+    app.worker.is_paused = Mock(return_value=False)
+    app.worker.pause = Mock()
+
+    assert app._on_spacebar_pause(types.SimpleNamespace(widget=app.tree)) == "break"
+
+    app.worker.pause.assert_called_once()
+    assert app.pause_btn.cget("text") == "Resume Scan"
+    root.destroy()
+
+
+def test_stop_attack_stops_controller_and_auto_deauth():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.attack.stop_current = Mock(return_value=True)
+    app.auto_deauth_var.set(True)
+
+    app._stop_attack()
+
+    app.attack.stop_current.assert_called_once()
+    assert app.auto_deauth_var.get() is False
+    assert "Attack stopped" in app.status.cget("text")
+    root.destroy()
+
+
+def test_start_monitor_reports_scan_launch_failure(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    monkeypatch.setattr(_n2ng, "scan_prefix", lambda: str(tmp_path / "n2ng_scan"))
+    app.adapter_var.set("wlan0")
+    app.airmon.start_monitor = Mock(return_value="wlan0mon")
+    app.airmon.stop_monitor = Mock()
+    app.worker.start_scan = Mock(return_value=(False, "airodump missing"))
+    app.raw_view.start = Mock()
+
+    app._start_monitor()
+
+    app.airmon.stop_monitor.assert_called_once_with("wlan0mon")
+    app.raw_view.start.assert_not_called()
+    assert "airodump missing" in app.status.cget("text")
+    assert str(app.pause_btn.cget("state")) == tk.DISABLED
+    root.destroy()
+
+
+def test_lock_target_reports_scan_launch_failure(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    monkeypatch.setattr(_n2ng, "target_capture_prefix", lambda _essid, _bssid: str(tmp_path / "capture"))
+    app.mon_iface = "wlan0mon"
+    bssid = "AA:BB:CC:DD:EE:FF"
+    app.networks[bssid] = {
+        "bssid": bssid,
+        "essid": "Net",
+        "channel": "6",
+        "power": "-50",
+        "privacy": "WPA2",
+        "cipher": "CCMP",
+        "auth": "PSK",
+    }
+    app.worker.start_lock = Mock(return_value=(False, "lock failed"))
+    app.raw_view.start = Mock()
+
+    app._lock_target(bssid)
+
+    app.raw_view.start.assert_not_called()
+    assert app.locked_target is None
+    assert "lock failed" in app.status.cget("text")
+    root.destroy()
+
+
+def test_client_update_preserves_selection():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.locked_target = {"bssid": "AA:BB:CC:DD:EE:FF", "essid": "MyWiFi"}
+    clients = [
+        {"station": "11:22:33:44:55:66", "power": "-60", "packets": "50", "bssid": "AA:BB:CC:DD:EE:FF", "probed": ""},
+    ]
+
+    app._update_clients(clients)
+    app.client_tree.selection_set("11:22:33:44:55:66")
+    app._update_clients(clients)
+
+    assert app.client_tree.selection() == ("11:22:33:44:55:66",)
+    root.destroy()
+
+
+def test_client_right_click_deauths_selected_station():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.locked_target = {"bssid": "AA:BB:CC:DD:EE:FF", "essid": "MyWiFi"}
+    app.mon_iface = "wlan0mon"
+    app._confirm_attack = Mock(return_value=True)
+    app.attack.deauth_client = Mock()
+    clients = [
+        {"station": "11:22:33:44:55:66", "power": "-60", "packets": "50", "bssid": "AA:BB:CC:DD:EE:FF", "probed": ""},
+    ]
+    app._update_clients(clients)
+
+    app._deauth_client_by_station("11:22:33:44:55:66")
+
+    app.attack.deauth_client.assert_called_once_with(
+        "AA:BB:CC:DD:EE:FF", "11:22:33:44:55:66", "wlan0mon", count=10
+    )
+    root.destroy()
+
+
+def test_reaver_button_runs_locked_target_command():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.locked_target = {"bssid": "AA:BB:CC:DD:EE:FF", "channel": "6"}
+    app.mon_iface = "wlan0mon"
+    app._confirm_attack = Mock(return_value=True)
+    app.attack.reaver = Mock()
+
+    app._reaver_attack()
+
+    app.attack.reaver.assert_called_once_with("AA:BB:CC:DD:EE:FF", "6", "wlan0mon")
+    root.destroy()
+
+
+def test_context_menu_dismissal_destroys_active_menu():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    menu = Mock()
+    menu.winfo_exists.return_value = True
+    app._context_menu = menu
+
+    app._dismiss_context_menu(types.SimpleNamespace(widget=app.tree))
+
+    menu.unpost.assert_called_once()
+    menu.destroy.assert_called_once()
+    assert app._context_menu is None
+    root.destroy()
 
 
 def test_treeview_uses_dark_theme():
@@ -191,6 +438,48 @@ def test_raw_view_widget_exists():
     root.destroy()
 
 
+def test_raw_view_has_vertical_and_horizontal_scrollbars():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+
+    assert str(app.raw_view.y_scrollbar.cget("orient")) == "vertical"
+    assert str(app.raw_view.x_scrollbar.cget("orient")) == "horizontal"
+    assert app.raw_view.text.cget("wrap") == tk.NONE
+    assert app.raw_view.text.cget("xscrollcommand")
+    assert app.raw_view.text.cget("yscrollcommand")
+    root.destroy()
+
+
+def test_raw_view_flushes_worker_raw_lines_without_own_process():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.worker.get_latest = Mock(return_value=([], []))
+    app.worker.get_raw_lines = Mock(return_value=["BSSID PWR CH ESSID", "AA:BB:CC:DD:EE:FF -50 6 Net"])
+    app.raw_view.start = Mock()
+
+    app._poll_queue()
+
+    assert app.raw_view.start.call_count == 0
+    text = app.raw_view.text.get("1.0", tk.END)
+    assert "AA:BB:CC:DD:EE:FF" in text
+    root.destroy()
+
+
+def test_main_content_grid_expands_with_window():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+
+    assert root.grid_rowconfigure(1)["weight"] == 1
+    assert root.grid_columnconfigure(0)["weight"] == 1
+    assert app.content_frame.grid_rowconfigure(0)["weight"] == 1
+    assert app.content_frame.grid_columnconfigure(0)["weight"] == 1
+    assert app.content_frame.grid_columnconfigure(1)["weight"] == 1
+    root.destroy()
+
+
 def test_treeview_is_monospace():
     """Network Treeview must use a monospace font."""
     root = tk.Tk()
@@ -202,8 +491,8 @@ def test_treeview_is_monospace():
     root.destroy()
 
 
-def test_flash_on_power_update():
-    """A row should temporarily get a flash tag when PWR changes."""
+def test_power_update_does_not_flash_row():
+    """PWR changes should update values without rapid flash highlighting."""
     root = tk.Tk()
     root.withdraw()
     app = _n2ng.N2NgApp(root)
@@ -216,5 +505,5 @@ def test_flash_on_power_update():
     app._networks_prev[bssid] = {"power": "-60", "beacons": "10"}
     app._update_networks([net])
     tags = app.tree.item(bssid, "tags")
-    assert "flash" in tags
+    assert "flash" not in tags
     root.destroy()
