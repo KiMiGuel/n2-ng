@@ -30,10 +30,6 @@ Built for Kali. Tested on caffeine. Approved by anyone who's ever typed aireplay
 - Right-click context menu for cap merge/fix
 - .cap / .pcap / .22000 export support
 
-## Screenshot
-
-![N2-NG screenshot placeholder](docs/screenshot-placeholder.svg)
-
 ## Quick Start
 
 ```bash
