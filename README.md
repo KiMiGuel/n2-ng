@@ -152,3 +152,11 @@ GPL-3.0. See [LICENSE](LICENSE).
 <p align="center">
   <sub>By <b>KiMiGuEL</b> — <a href="https://github.com/KiMiGuel">INDEPENTEST</a></sub>
 </p>
+
+## Kali Official Repository (In Review)
+
+N2-NG has been submitted for inclusion in Kali Linux repositories.
+
+- **Bug ID:** [0009789](https://bugs.kali.org/view.php?id=0009789)
+- **Status:** Under review for kali-bleeding-edge, with potential promotion to kali-rolling
+- **Current install method:** Use the APT repo above until official inclusion
