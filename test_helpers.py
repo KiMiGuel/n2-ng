@@ -128,24 +128,186 @@ def test_capture_fix_uses_pcapfix_outfile_flag(monkeypatch, tmp_path):
     monkeypatch.setattr(_n2ng.subprocess, "run", fake_run)
     manager = _n2ng.CaptureManager(_n2ng.queue.Queue(), lambda _msg: None)
 
-    assert manager.fix(cap) == out
-    assert calls == [["pcapfix", "-o", str(out), str(cap)]]
+    result = manager.fix(cap)
+
+    assert result.ok is True
+    assert result.output == out
+    assert calls == [["/usr/bin/pcapfix", "-k", "-o", str(out), str(cap)]]
 
 
-def test_dependency_checker_uses_command_v_return_code(monkeypatch):
-    calls = []
+def test_capture_fix_reports_no_output_even_when_pcapfix_returns_zero(monkeypatch, tmp_path):
+    cap = tmp_path / "capture.cap"
+    cap.write_bytes(b"pcap")
 
     def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        return types.SimpleNamespace(returncode=0 if "pcapfix" in cmd[-1] else 1)
+        return types.SimpleNamespace(returncode=0, stdout="Nothing to fix!", stderr="")
 
+    monkeypatch.setattr(_n2ng.shutil, "which", lambda cmd: "/usr/bin/pcapfix" if cmd == "pcapfix" else None)
     monkeypatch.setattr(_n2ng.subprocess, "run", fake_run)
+    manager = _n2ng.CaptureManager(_n2ng.queue.Queue(), lambda _msg: None)
+
+    result = manager.fix(cap)
+
+    assert result.ok is False
+    assert result.returncode == 0
+    assert "did not write" in result.message
+    assert "Nothing to fix" in result.stdout
+
+
+def test_dependency_checker_uses_shared_path_resolution(monkeypatch):
+    calls = []
+
+    def fake_which(cmd):
+        calls.append(cmd)
+        return "/usr/bin/pcapfix" if cmd == "pcapfix" else None
+
+    monkeypatch.setattr(_n2ng.shutil, "which", fake_which)
 
     statuses = _n2ng.DependencyChecker.check_all()
 
     assert statuses["pcapfix"]["installed"] is True
+    assert statuses["pcapfix"]["path"] == "/usr/bin/pcapfix"
     assert statuses["airmon-ng"]["installed"] is False
-    assert any(cmd[:2] == ["sh", "-c"] and "command -v pcapfix" in cmd[-1] for cmd in calls)
+    assert "pcapfix" in calls
+
+
+def test_capture_merge_uses_resolved_mergecap_and_reports_failure(monkeypatch, tmp_path):
+    calls = []
+    cap1 = tmp_path / "one.cap"
+    cap2 = tmp_path / "two.cap"
+    out = tmp_path / "merged.cap"
+    cap1.write_bytes(b"one")
+    cap2.write_bytes(b"two")
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=2, stdout="", stderr="bad input")
+
+    monkeypatch.setattr(_n2ng.shutil, "which", lambda cmd: "/usr/bin/mergecap" if cmd == "mergecap" else None)
+    monkeypatch.setattr(_n2ng.subprocess, "run", fake_run)
+    manager = _n2ng.CaptureManager(_n2ng.queue.Queue(), lambda _msg: None)
+
+    result = manager.merge([cap1, cap2], out)
+
+    assert result.ok is False
+    assert result.returncode == 2
+    assert "bad input" in result.stderr
+    assert calls == [["/usr/bin/mergecap", "-w", str(out), str(cap1), str(cap2)]]
+
+
+def test_capture_to_22000_uses_hcxpcapngtool_and_validates_records(monkeypatch, tmp_path):
+    calls = []
+    cap = tmp_path / "capture with space.cap"
+    cap.write_bytes(b"pcap")
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_text("WPA*02*abc\n")
+        return types.SimpleNamespace(returncode=0, stdout="processed", stderr="")
+
+    monkeypatch.setattr(_n2ng.shutil, "which", lambda cmd: "/usr/bin/hcxpcapngtool" if cmd == "hcxpcapngtool" else None)
+    monkeypatch.setattr(_n2ng.subprocess, "run", fake_run)
+    manager = _n2ng.CaptureManager(_n2ng.queue.Queue(), lambda _msg: None)
+
+    result = manager.convert_to_22000(cap)
+
+    assert result.ok is True
+    assert result.output == tmp_path / "capture with space.22000"
+    assert result.record_count == 1
+    assert calls == [["/usr/bin/hcxpcapngtool", "-o", str(result.output), str(cap)]]
+
+
+def test_capture_to_22000_reports_no_hashes(monkeypatch, tmp_path):
+    cap = tmp_path / "capture.cap"
+    cap.write_bytes(b"pcap")
+
+    def fake_run(cmd, **kwargs):
+        Path(cmd[cmd.index("-o") + 1]).write_text("")
+        return types.SimpleNamespace(returncode=0, stdout="processed", stderr="")
+
+    monkeypatch.setattr(_n2ng.shutil, "which", lambda cmd: "/usr/bin/hcxpcapngtool" if cmd == "hcxpcapngtool" else None)
+    monkeypatch.setattr(_n2ng.subprocess, "run", fake_run)
+    manager = _n2ng.CaptureManager(_n2ng.queue.Queue(), lambda _msg: None)
+
+    result = manager.convert_to_22000(cap)
+
+    assert result.ok is False
+    assert "no usable PMKID or EAPOL" in result.message
+
+
+def test_capture_to_pcapng_uses_editcap(monkeypatch, tmp_path):
+    calls = []
+    cap = tmp_path / "capture.cap"
+    cap.write_bytes(b"pcap")
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[-1]).write_bytes(b"pcapng")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_n2ng.shutil, "which", lambda cmd: "/usr/bin/editcap" if cmd == "editcap" else None)
+    monkeypatch.setattr(_n2ng.subprocess, "run", fake_run)
+    manager = _n2ng.CaptureManager(_n2ng.queue.Queue(), lambda _msg: None)
+
+    result = manager.convert_to_pcapng(cap)
+
+    assert result.ok is True
+    assert result.output == tmp_path / "capture.pcapng"
+    assert calls == [["/usr/bin/editcap", "-F", "pcapng", str(cap), str(result.output)]]
+
+
+def test_reconstruct_cap_from_hash_uses_hcxhash2cap(monkeypatch, tmp_path):
+    calls = []
+    hash_file = tmp_path / "capture.22000"
+    hash_file.write_text("WPA*01*abc\n")
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-c") + 1]).write_bytes(b"cap")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_n2ng.shutil, "which", lambda cmd: "/usr/bin/hcxhash2cap" if cmd == "hcxhash2cap" else None)
+    monkeypatch.setattr(_n2ng.subprocess, "run", fake_run)
+    manager = _n2ng.CaptureManager(_n2ng.queue.Queue(), lambda _msg: None)
+
+    result = manager.reconstruct_cap_from_hash(hash_file)
+
+    assert result.ok is True
+    assert result.output == tmp_path / "capture.reconstructed.cap"
+    assert calls == [["/usr/bin/hcxhash2cap", f"--pmkid-eapol={hash_file}", "-c", str(result.output)]]
+
+
+def test_hashcat_command_builder_requires_attack_mode_and_wordlist(tmp_path):
+    hash_file = tmp_path / "capture.22000"
+    wordlist = tmp_path / "words.txt"
+
+    command = _n2ng.build_hashcat_command(hash_file, wordlist, session="n2ng-test")
+
+    assert command == [
+        "hashcat",
+        "-m",
+        "22000",
+        "-a",
+        "0",
+        "--session",
+        "n2ng-test",
+        str(hash_file),
+        str(wordlist),
+    ]
+
+
+def test_dependency_checker_reports_workflow_tools(monkeypatch):
+    monkeypatch.setattr(_n2ng.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr(_n2ng.DependencyChecker, "_tool_version", classmethod(lambda cls, resolved: "v1"))
+    monkeypatch.setattr(_n2ng.DependencyChecker, "_hashcat_backend_status", classmethod(lambda cls, resolved: (False, "No backend")))
+
+    statuses = _n2ng.DependencyChecker.check_all()
+
+    assert statuses["hcxpcapngtool"]["feature"] == "Capture to Hashcat 22000 conversion"
+    assert statuses["hashcat"]["installed"] is True
+    assert statuses["hashcat"]["usable"] is False
+    assert statuses["hashcat"]["runtime_status"] == "No backend"
+    assert statuses["editcap"]["feature"] == "Capture to PCAPNG normalization"
 
 
 def test_attack_controller_can_stop_running_attack(monkeypatch):

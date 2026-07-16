@@ -12,13 +12,15 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
 import tkinter.font as tk_font
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
 THEME = {
@@ -30,6 +32,37 @@ THEME = {
     "error": "#ff4444",
     "info": "#00ccff",
 }
+
+
+VALID_CAPTURE_SUFFIXES = {".cap", ".pcap", ".pcapng"}
+VALID_HISTORY_SUFFIXES = VALID_CAPTURE_SUFFIXES | {".22000"}
+HASHCAT_22000_PREFIXES = ("WPA*01*", "WPA*02*")
+
+
+@dataclass(frozen=True)
+class ToolResolution:
+    name: str
+    cmd: str
+    path: str | None
+    apt: str = ""
+    required: bool = False
+
+    @property
+    def installed(self) -> bool:
+        return self.path is not None
+
+
+@dataclass(frozen=True)
+class CaptureProcessResult:
+    ok: bool
+    output: Path | None = None
+    message: str = ""
+    returncode: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    command: list[str] | None = None
+    record_count: int = 0
+    record_types: tuple[str, ...] = ()
 
 
 class AnsiParser:
@@ -188,6 +221,95 @@ def capture_root(create: bool = True) -> Path:
     return root
 
 
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.stem}_{int(time.time())}{path.suffix}")
+
+
+def fixed_capture_output_path(cap: Path) -> Path:
+    suffix = cap.suffix if cap.suffix.lower() in VALID_CAPTURE_SUFFIXES else ".cap"
+    return unique_path(cap.with_name(f"{cap.stem}.fixed{suffix}"))
+
+
+def pcapng_output_path(cap: Path) -> Path:
+    return unique_path(cap.with_name(f"{cap.stem}.pcapng"))
+
+
+def hashcat_22000_output_path(cap: Path) -> Path:
+    return unique_path(cap.with_suffix(".22000"))
+
+
+def reconstructed_cap_output_path(hash_file: Path) -> Path:
+    return unique_path(hash_file.with_name(f"{hash_file.stem}.reconstructed.cap"))
+
+
+def merged_capture_output_path(caps: list[Path]) -> Path:
+    first = caps[0]
+    suffix = first.suffix if first.suffix.lower() in VALID_CAPTURE_SUFFIXES else ".pcapng"
+    return unique_path(first.with_name(f"{first.stem}.merged{suffix}"))
+
+
+def is_supported_capture(path: Path) -> bool:
+    return path.suffix.lower() in VALID_CAPTURE_SUFFIXES
+
+
+def has_hashcat_22000_content(text: str) -> bool:
+    return any(line.startswith(HASHCAT_22000_PREFIXES) for line in text.splitlines())
+
+
+def hashcat_22000_info(path: Path) -> dict:
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return {"valid": False, "records": 0, "pmkid": 0, "eapol": 0, "types": ()}
+    pmkid = 0
+    eapol = 0
+    for line in text.splitlines():
+        if line.startswith("WPA*01*"):
+            pmkid += 1
+        elif line.startswith("WPA*02*"):
+            eapol += 1
+    types = []
+    if pmkid:
+        types.append("PMKID")
+    if eapol:
+        types.append("EAPOL")
+    records = pmkid + eapol
+    return {"valid": records > 0, "records": records, "pmkid": pmkid, "eapol": eapol, "types": tuple(types)}
+
+
+def is_hashcat_22000_file(path: Path) -> bool:
+    return path.suffix.lower() == ".22000"
+
+
+def default_hashcat_wordlist() -> Path | None:
+    wordlist = Path("/usr/share/wordlists/rockyou.txt")
+    return wordlist if wordlist.exists() else None
+
+
+def build_hashcat_command(hash_file: Path, wordlist: Path | None, attack_mode: str = "0", mask: str | None = None, session: str | None = None) -> list[str]:
+    cmd = ["hashcat", "-m", "22000", "-a", attack_mode]
+    if session:
+        cmd.extend(["--session", session])
+    cmd.append(str(hash_file))
+    if attack_mode == "0":
+        if wordlist is None:
+            raise ValueError("Dictionary attack requires a wordlist.")
+        cmd.append(str(wordlist))
+    elif attack_mode == "3":
+        if not mask:
+            raise ValueError("Mask attack requires an explicit mask.")
+        cmd.append(mask)
+    else:
+        raise ValueError(f"Unsupported attack mode: {attack_mode}")
+    return cmd
+
+
 def scan_prefix(create: bool = True) -> str:
     scan_dir = capture_root(create=create) / "scan"
     if create:
@@ -232,38 +354,99 @@ class DependencyChecker:
         "ip": {"cmd": "ip", "apt": "sudo apt install -y iproute2"},
     }
     OPTIONAL_TOOLS = {
-        "hcxpcapngtool": {"cmd": "hcxpcapngtool", "apt": "sudo apt install -y hcxtools"},
+        "hcxpcapngtool": {"cmd": "hcxpcapngtool", "apt": "sudo apt install -y hcxtools", "feature": "Capture to Hashcat 22000 conversion"},
+        "hcxhash2cap": {"cmd": "hcxhash2cap", "apt": "sudo apt install -y hcxtools", "feature": "Reconstructed CAP from 22000 hashes"},
         "wash": {"cmd": "wash", "apt": "sudo apt install -y reaver"},
         "reaver": {"cmd": "reaver", "apt": "sudo apt install -y reaver"},
-        "mergecap": {"cmd": "mergecap", "apt": "sudo apt install -y wireshark-common"},
-        "pcapfix": {"cmd": "pcapfix", "apt": "sudo apt install -y pcapfix"},
+        "mergecap": {"cmd": "mergecap", "apt": "sudo apt install -y wireshark-common", "feature": "Capture merge"},
+        "editcap": {"cmd": "editcap", "apt": "sudo apt install -y wireshark-common", "feature": "Capture to PCAPNG normalization"},
+        "tshark": {"cmd": "tshark", "apt": "sudo apt install -y tshark", "feature": "Capture inspection"},
+        "pcapfix": {"cmd": "pcapfix", "apt": "sudo apt install -y pcapfix", "feature": "Capture repair"},
+        "hashcat": {"cmd": "hashcat", "apt": "sudo apt install -y hashcat", "feature": "Hashcat cracking"},
     }
     TOOLS = {**REQUIRED_TOOLS, **OPTIONAL_TOOLS}
 
     @classmethod
-    def is_installed(cls, cmd: str) -> bool:
-        result = subprocess.run(
-            ["sh", "-c", f"command -v {shlex.quote(cmd)}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    def resolve_tool(cls, name: str) -> ToolResolution:
+        info = cls.TOOLS.get(name, {"cmd": name, "apt": ""})
+        cmd = info["cmd"]
+        path = shutil.which(cmd)
+        return ToolResolution(
+            name=name,
+            cmd=cmd,
+            path=path,
+            apt=info.get("apt", ""),
+            required=name in cls.REQUIRED_TOOLS,
         )
-        return result.returncode == 0
+
+    @classmethod
+    def _tool_version(cls, resolved: ToolResolution) -> str:
+        if not resolved.installed:
+            return ""
+        version_args = {
+            "hcxpcapngtool": ["-v"],
+            "hcxhash2cap": ["-v"],
+            "hashcat": ["--version"],
+            "editcap": ["--version"],
+            "tshark": ["--version"],
+            "mergecap": ["--version"],
+            "pcapfix": ["--help"],
+        }.get(resolved.name, ["--version"])
+        try:
+            rc = subprocess.run([resolved.path] + version_args, capture_output=True, text=True, timeout=8)
+        except Exception as exc:
+            return f"version check failed: {exc}"
+        text = (rc.stdout or rc.stderr or "").strip().splitlines()
+        return text[0] if text else ""
+
+    @classmethod
+    def _hashcat_backend_status(cls, resolved: ToolResolution) -> tuple[bool, str]:
+        if not resolved.installed:
+            return False, "Missing"
+        with tempfile.TemporaryDirectory(prefix="n2ng-hashcat-check-") as temp_home:
+            env = os.environ.copy()
+            env["XDG_DATA_HOME"] = str(Path(temp_home) / "data")
+            env["XDG_CACHE_HOME"] = str(Path(temp_home) / "cache")
+            try:
+                rc = subprocess.run([resolved.path, "-I"], capture_output=True, text=True, timeout=20, env=env)
+            except Exception as exc:
+                return False, f"Execution error: {exc}"
+        combined = f"{rc.stdout}\n{rc.stderr}"
+        if rc.returncode == 0:
+            return True, "Backend available"
+        if "No OpenCL" in combined or "CL_PLATFORM_NOT_FOUND" in combined or "No OpenCL, HIP or CUDA" in combined:
+            return False, "Installed, but no usable OpenCL/HIP/CUDA backend detected"
+        return False, combined.strip().splitlines()[-1] if combined.strip() else f"Exited {rc.returncode}"
+
+    @classmethod
+    def _status_for(cls, name: str, info: dict, required: bool) -> dict:
+        resolved = cls.resolve_tool(name)
+        usable = resolved.installed
+        runtime_status = "Installed" if resolved.installed else "Missing"
+        if name == "hashcat":
+            usable, runtime_status = cls._hashcat_backend_status(resolved)
+        return {
+            **info,
+            "required": required,
+            "installed": resolved.installed,
+            "path": resolved.path,
+            "feature": info.get("feature", ""),
+            "version": cls._tool_version(resolved),
+            "usable": usable,
+            "runtime_status": runtime_status,
+        }
+
+    @classmethod
+    def is_installed(cls, cmd: str) -> bool:
+        return cls.resolve_tool(cmd).installed
 
     @classmethod
     def check_all(cls) -> dict[str, dict]:
         statuses = {}
         for name, info in cls.REQUIRED_TOOLS.items():
-            statuses[name] = {
-                **info,
-                "required": True,
-                "installed": cls.is_installed(info["cmd"]),
-            }
+            statuses[name] = cls._status_for(name, info, True)
         for name, info in cls.OPTIONAL_TOOLS.items():
-            statuses[name] = {
-                **info,
-                "required": False,
-                "installed": cls.is_installed(info["cmd"]),
-            }
+            statuses[name] = cls._status_for(name, info, False)
         return statuses
 
 
@@ -312,10 +495,14 @@ class DependencySplash(tk.Toplevel):
         missing_required = []
         for name, status in statuses.items():
             label = "required" if status["required"] else "optional"
+            feature = f" - {status['feature']}" if status.get("feature") else ""
+            path = f" [{status['path']}]" if status.get("path") else ""
             if status["installed"]:
-                self._append(f"[OK]      {name} ({label})")
+                marker = "[OK]     " if status.get("usable", True) else "[WARN]   "
+                runtime = status.get("runtime_status", "Installed")
+                self._append(f"{marker} {name} ({label}){feature} - {runtime}{path}")
             else:
-                self._append(f"[MISSING] {name} ({label}) - install: {status['apt']}")
+                self._append(f"[MISSING] {name} ({label}){feature} - install: {status['apt']}")
                 if status["required"]:
                     missing_required.append(name)
         self._checks_done = True
@@ -970,9 +1157,10 @@ class CaptureManager:
         out22000 = self.active_cap.with_suffix(".22000")
         tmp = self.active_cap.with_suffix(".tmp22000")
         rc = None
-        if shutil.which("hcxpcapngtool"):
+        hcx = DependencyChecker.resolve_tool("hcxpcapngtool")
+        if hcx.installed:
             rc = subprocess.run(
-                ["hcxpcapngtool", "-o", str(tmp), str(self.active_cap)],
+                [hcx.path, "-o", str(tmp), str(self.active_cap)],
                 capture_output=True, text=True
             )
         elif shutil.which("aircrack-ng"):
@@ -1000,28 +1188,322 @@ class CaptureManager:
             self.queue.put(("pmkid", {"file": str(path), "type": "pmkid"}))
 
     def convert(self, cap: Path) -> Path | None:
-        out = cap.with_suffix(".22000")
-        if shutil.which("hcxpcapngtool"):
-            rc = subprocess.run(["hcxpcapngtool", "-o", str(out), str(cap)], capture_output=True, text=True)
-            if rc.returncode == 0 and out.exists() and out.stat().st_size > 0:
-                return out
-        return None
+        result = self.convert_to_22000(cap)
+        return result.output if result.ok else None
 
-    def merge(self, caps: list[Path], output: Path) -> bool:
-        if not shutil.which("mergecap"):
-            return False
-        cmd = ["mergecap", "-w", str(output)] + [str(c) for c in caps]
+    def convert_to_22000(self, cap: Path) -> CaptureProcessResult:
+        if not is_supported_capture(cap):
+            return CaptureProcessResult(False, message="Only .cap, .pcap, and .pcapng files can be converted to .22000.")
+        hcx = DependencyChecker.resolve_tool("hcxpcapngtool")
+        if not hcx.installed:
+            return CaptureProcessResult(False, message=f"hcxpcapngtool is not installed. Install with: {hcx.apt}")
+        out = hashcat_22000_output_path(cap)
+        cmd = [hcx.path, "-o", str(out), str(cap)]
         rc = subprocess.run(cmd, capture_output=True, text=True)
-        return rc.returncode == 0 and output.exists() and output.stat().st_size > 0
+        stdout = getattr(rc, "stdout", "")
+        stderr = getattr(rc, "stderr", "")
+        info = hashcat_22000_info(out) if out.exists() else {"valid": False, "records": 0, "types": ()}
+        if rc.returncode == 0 and info["valid"]:
+            return CaptureProcessResult(
+                True,
+                output=out,
+                message=f"Extracted {info['records']} Hashcat 22000 record(s).",
+                returncode=rc.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                command=cmd,
+                record_count=info["records"],
+                record_types=info["types"],
+            )
+        if rc.returncode == 0:
+            return CaptureProcessResult(
+                False,
+                output=out if out.exists() else None,
+                message="The capture was processed successfully, but no usable PMKID or EAPOL hash records were found.",
+                returncode=rc.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                command=cmd,
+            )
+        return CaptureProcessResult(
+            False,
+            output=out if out.exists() else None,
+            message="hcxpcapngtool failed to extract Hashcat 22000 records.",
+            returncode=rc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            command=cmd,
+        )
 
-    def fix(self, cap: Path) -> Path | None:
-        if not shutil.which("pcapfix"):
-            return None
-        out = cap.with_suffix(".fixed.cap")
-        rc = subprocess.run(["pcapfix", "-o", str(out), str(cap)], capture_output=True, text=True)
+    def convert_to_pcapng(self, cap: Path) -> CaptureProcessResult:
+        if not is_supported_capture(cap):
+            return CaptureProcessResult(False, message="Only .cap, .pcap, and .pcapng files can be normalized to PCAPNG.")
+        editcap = DependencyChecker.resolve_tool("editcap")
+        if not editcap.installed:
+            return CaptureProcessResult(False, message=f"editcap is not installed. Install with: {editcap.apt}")
+        out = pcapng_output_path(cap)
+        cmd = [editcap.path, "-F", "pcapng", str(cap), str(out)]
+        rc = subprocess.run(cmd, capture_output=True, text=True)
+        stdout = getattr(rc, "stdout", "")
+        stderr = getattr(rc, "stderr", "")
         if rc.returncode == 0 and out.exists() and out.stat().st_size > 0:
-            return out
-        return None
+            return CaptureProcessResult(True, output=out, message=f"PCAPNG capture saved to {out}", returncode=rc.returncode, stdout=stdout, stderr=stderr, command=cmd)
+        return CaptureProcessResult(False, output=out, message="editcap did not produce a PCAPNG output file.", returncode=rc.returncode, stdout=stdout, stderr=stderr, command=cmd)
+
+    def reconstruct_cap_from_hash(self, hash_file: Path) -> CaptureProcessResult:
+        if not is_hashcat_22000_file(hash_file):
+            return CaptureProcessResult(False, message="Select a .22000 file to reconstruct a synthetic CAP.")
+        info = hashcat_22000_info(hash_file)
+        if not info["valid"]:
+            return CaptureProcessResult(False, message="No valid Hashcat 22000 records were found.")
+        hcxhash2cap = DependencyChecker.resolve_tool("hcxhash2cap")
+        if not hcxhash2cap.installed:
+            return CaptureProcessResult(False, message=f"hcxhash2cap is not installed. Install with: {hcxhash2cap.apt}")
+        out = reconstructed_cap_output_path(hash_file)
+        cmd = [hcxhash2cap.path, f"--pmkid-eapol={hash_file}", "-c", str(out)]
+        rc = subprocess.run(cmd, capture_output=True, text=True)
+        stdout = getattr(rc, "stdout", "")
+        stderr = getattr(rc, "stderr", "")
+        if rc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            return CaptureProcessResult(True, output=out, message=f"Reconstructed synthetic CAP saved to {out}", returncode=rc.returncode, stdout=stdout, stderr=stderr, command=cmd)
+        return CaptureProcessResult(False, output=out, message="hcxhash2cap did not produce a reconstructed CAP.", returncode=rc.returncode, stdout=stdout, stderr=stderr, command=cmd)
+
+    def merge(self, caps: list[Path], output: Path) -> CaptureProcessResult:
+        if len(caps) < 2:
+            return CaptureProcessResult(False, message="Select at least two captures to merge.")
+        if not all(is_supported_capture(cap) for cap in caps):
+            return CaptureProcessResult(False, message="Only .cap, .pcap, and .pcapng captures can be merged.")
+        mergecap = DependencyChecker.resolve_tool("mergecap")
+        if not mergecap.installed:
+            return CaptureProcessResult(False, message=f"mergecap is not installed. Install with: {mergecap.apt}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [mergecap.path, "-w", str(output)] + [str(c) for c in caps]
+        rc = subprocess.run(cmd, capture_output=True, text=True)
+        stdout = getattr(rc, "stdout", "")
+        stderr = getattr(rc, "stderr", "")
+        if rc.returncode == 0 and output.exists() and output.stat().st_size > 0:
+            return CaptureProcessResult(
+                True,
+                output=output,
+                message=f"Merged capture saved to {output}",
+                returncode=rc.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                command=cmd,
+            )
+        return CaptureProcessResult(
+            False,
+            output=output,
+            message="mergecap did not produce a merged capture.",
+            returncode=rc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            command=cmd,
+        )
+
+    def fix(self, cap: Path) -> CaptureProcessResult:
+        pcapfix = DependencyChecker.resolve_tool("pcapfix")
+        if not pcapfix.installed:
+            return CaptureProcessResult(False, message=f"pcapfix is not installed. Install with: {pcapfix.apt}")
+        out = fixed_capture_output_path(cap)
+        cmd = [pcapfix.path, "-k", "-o", str(out), str(cap)]
+        rc = subprocess.run(cmd, capture_output=True, text=True)
+        stdout = getattr(rc, "stdout", "")
+        stderr = getattr(rc, "stderr", "")
+        if rc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            return CaptureProcessResult(
+                True,
+                output=out,
+                message=f"Fixed capture saved to {out}",
+                returncode=rc.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                command=cmd,
+            )
+        message = "pcapfix did not write a repaired output file."
+        if rc.returncode != 0:
+            message = "pcapfix failed."
+        return CaptureProcessResult(
+            False,
+            output=out,
+            message=message,
+            returncode=rc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            command=cmd,
+        )
+
+
+class ConversionDialog(tk.Toplevel):
+    def __init__(self, parent, input_path: Path, manager: CaptureManager, mode: str = "22000"):
+        super().__init__(parent)
+        self.input_path = input_path
+        self.manager = manager
+        self.mode = tk.StringVar(value=mode)
+        self.result: CaptureProcessResult | None = None
+        self.title("N2-ng Convert Capture")
+        self.configure(bg=THEME["panel"])
+        self.geometry("720x420")
+        self.transient(parent)
+
+        tk.Label(self, text="Convert capture", bg=THEME["panel"], fg=THEME["fg"], font=("TkDefaultFont", 12, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 4))
+        body = tk.Frame(self, bg=THEME["panel"])
+        body.pack(fill=tk.X, padx=10)
+        lines = [
+            f"Input: {input_path.name}",
+            f"Format: {input_path.suffix.lower() or 'unknown'}",
+            f"Directory: {input_path.parent}",
+            f"hcxpcapngtool: {DependencyChecker.resolve_tool('hcxpcapngtool').path or 'missing'}",
+            f"editcap: {DependencyChecker.resolve_tool('editcap').path or 'missing'}",
+            "22000 purpose: Extract WPA PMKID and EAPOL hash records for Hashcat.",
+        ]
+        for line in lines:
+            tk.Label(body, text=line, bg=THEME["panel"], fg=THEME["fg"], anchor=tk.W, justify=tk.LEFT, wraplength=680).pack(fill=tk.X)
+
+        modes = tk.Frame(self, bg=THEME["panel"])
+        modes.pack(anchor=tk.W, padx=10, pady=6)
+        tk.Radiobutton(modes, text="Hashcat 22000", variable=self.mode, value="22000", bg=THEME["panel"], fg=THEME["fg"], selectcolor=THEME["panel"]).pack(side=tk.LEFT)
+        tk.Radiobutton(modes, text="Normalized PCAPNG", variable=self.mode, value="pcapng", bg=THEME["panel"], fg=THEME["fg"], selectcolor=THEME["panel"]).pack(side=tk.LEFT, padx=10)
+
+        self.status = tk.Text(self, height=9, bg=THEME["bg"], fg=THEME["fg"], wrap=tk.WORD)
+        self.status.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        self._write_status(self._preview_text())
+
+        buttons = tk.Frame(self, bg=THEME["panel"])
+        buttons.pack(fill=tk.X, padx=10, pady=(0, 10))
+        tk.Button(buttons, text="Convert", command=self._convert, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT)
+        tk.Button(buttons, text="Cancel", command=self.destroy, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.RIGHT)
+
+    def _preview_text(self) -> str:
+        if self.mode.get() == "pcapng":
+            out = pcapng_output_path(self.input_path)
+            return f"Output file: {out}\nCommand: editcap -F pcapng {shlex.quote(str(self.input_path))} {shlex.quote(str(out))}"
+        out = hashcat_22000_output_path(self.input_path)
+        return f"Output file: {out}\nCommand: hcxpcapngtool -o {shlex.quote(str(out))} {shlex.quote(str(self.input_path))}"
+
+    def _write_status(self, text: str):
+        self.status.config(state=tk.NORMAL)
+        self.status.delete("1.0", tk.END)
+        self.status.insert(tk.END, text)
+        self.status.config(state=tk.DISABLED)
+
+    def _convert(self):
+        if self.mode.get() == "pcapng":
+            self.result = self.manager.convert_to_pcapng(self.input_path)
+        else:
+            self.result = self.manager.convert_to_22000(self.input_path)
+        details = [self.result.message]
+        if self.result.output:
+            details.append(f"Output: {self.result.output}")
+        if self.result.record_count:
+            details.append(f"Records: {self.result.record_count}")
+        if self.result.record_types:
+            details.append(f"Types: {', '.join(self.result.record_types)}")
+        if self.result.returncode is not None:
+            details.append(f"Exit code: {self.result.returncode}")
+        if self.result.stderr.strip():
+            details.append(f"stderr:\n{self.result.stderr.strip()}")
+        elif self.result.stdout.strip():
+            details.append(f"stdout:\n{self.result.stdout.strip()}")
+        self._write_status("\n\n".join(details))
+
+
+class HashcatDialog(tk.Toplevel):
+    def __init__(self, parent, hash_file: Path):
+        super().__init__(parent)
+        self.hash_file = hash_file
+        self.proc = None
+        self.thread = None
+        self.session_name = f"n2ng-{int(time.time())}"
+        self.title("N2-ng Hashcat")
+        self.configure(bg=THEME["panel"])
+        self.geometry("820x520")
+        self.transient(parent)
+
+        tk.Label(self, text="Hashcat dictionary attack", bg=THEME["panel"], fg=THEME["fg"], font=("TkDefaultFont", 12, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 4))
+        self.hash_var = tk.StringVar(value=str(hash_file))
+        self.wordlist_var = tk.StringVar(value=str(default_hashcat_wordlist() or ""))
+        for label, var in (("Hash file:", self.hash_var), ("Wordlist:", self.wordlist_var)):
+            row = tk.Frame(self, bg=THEME["panel"])
+            row.pack(fill=tk.X, padx=10, pady=2)
+            tk.Label(row, text=label, bg=THEME["panel"], fg=THEME["fg"], width=10, anchor=tk.W).pack(side=tk.LEFT)
+            tk.Entry(row, textvariable=var, bg=THEME["bg"], fg=THEME["fg"]).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            if label == "Wordlist:":
+                tk.Button(row, text="Browse", command=self._browse_wordlist, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=4)
+
+        self.preview_var = tk.StringVar()
+        tk.Label(self, textvariable=self.preview_var, bg=THEME["panel"], fg=THEME["fg"], anchor=tk.W, justify=tk.LEFT, wraplength=780).pack(fill=tk.X, padx=10, pady=4)
+        self.output = tk.Text(self, bg=THEME["bg"], fg=THEME["fg"], height=16, wrap=tk.WORD)
+        self.output.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        buttons = tk.Frame(self, bg=THEME["panel"])
+        buttons.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self.start_btn = tk.Button(buttons, text="Start", command=self._start, bg=THEME["panel"], fg=THEME["fg"])
+        self.stop_btn = tk.Button(buttons, text="Stop", command=self._stop, bg=THEME["error"], fg="#ffffff", state=tk.DISABLED)
+        self.start_btn.pack(side=tk.LEFT)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        tk.Button(buttons, text="Close", command=self.destroy, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.RIGHT)
+        self.wordlist_var.trace_add("write", lambda *_args: self._update_preview())
+        self._update_preview()
+
+    def _browse_wordlist(self):
+        path = filedialog.askopenfilename(parent=self, title="Select wordlist")
+        if path:
+            self.wordlist_var.set(path)
+
+    def _command(self) -> list[str]:
+        return build_hashcat_command(Path(self.hash_var.get()), Path(self.wordlist_var.get()), session=self.session_name)
+
+    def _update_preview(self):
+        try:
+            cmd = self._command()
+            self.preview_var.set("Command: " + " ".join(shlex.quote(part) for part in cmd))
+        except Exception as exc:
+            self.preview_var.set(f"Command unavailable: {exc}")
+
+    def _append(self, text: str):
+        self.output.insert(tk.END, text)
+        self.output.see(tk.END)
+
+    def _start(self):
+        if self.proc and self.proc.poll() is None:
+            return
+        hashcat = DependencyChecker.resolve_tool("hashcat")
+        if not hashcat.installed:
+            self._append("hashcat is not installed.\n")
+            return
+        usable, runtime = DependencyChecker._hashcat_backend_status(hashcat)
+        if not usable:
+            self._append(runtime + "\n")
+            return
+        try:
+            cmd = self._command()
+        except Exception as exc:
+            self._append(str(exc) + "\n")
+            return
+        cmd[0] = hashcat.path
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.thread = threading.Thread(target=self._run_hashcat, args=(cmd,), daemon=True)
+        self.thread.start()
+
+    def _run_hashcat(self, cmd: list[str]):
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in self.proc.stdout:
+            self.after(0, self._append, line)
+        rc = self.proc.wait()
+        state = "cracked/exhausted" if rc == 0 else ("aborted" if rc in (130, 143, -15) else "failed")
+        self.after(0, self._append, f"\nHashcat exited {rc}: {state}\n")
+        self.after(0, self.start_btn.config, {"state": tk.NORMAL})
+        self.after(0, self.stop_btn.config, {"state": tk.DISABLED})
+
+    def _stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            self.after(3000, self._force_stop)
+
+    def _force_stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
 
 
 class WpsScanner(threading.Thread):
@@ -1263,7 +1745,7 @@ class N2NgApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("N2-ng")
-        self.root.geometry("1200x700")
+        self.root.geometry("1320x760")
         self.root.minsize(1000, 600)
         self.root.configure(bg=THEME["bg"])
 
@@ -1284,6 +1766,9 @@ class N2NgApp:
         self.poll_id = None
         self._paused = False
         self._context_menu = None
+        self._history_paths: dict[str, Path] = {}
+        self._last_history_result = ""
+        self.hashcat_dialog = None
 
         self._configure_ttk_styles()
         self._build_ui()
@@ -1354,17 +1839,20 @@ class N2NgApp:
         self.content_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
         self.content_frame.grid_rowconfigure(0, weight=1)
         self.content_frame.grid_columnconfigure(0, weight=1)
-        self.content_frame.grid_columnconfigure(1, weight=1, minsize=420)
+        self.content_pane = tk.PanedWindow(self.content_frame, orient=tk.HORIZONTAL, sashwidth=6, sashrelief=tk.RAISED, bg=THEME["panel"])
+        self.content_pane.grid(row=0, column=0, sticky="nsew")
 
         # Left: network tree
         left_frame = tk.Frame(self.content_frame, bg=THEME["bg"])
-        left_frame.grid(row=0, column=0, sticky="nsew")
+        self.content_pane.add(left_frame, minsize=500, stretch="always")
         self._build_network_tree(left_frame)
 
         # Right: notebook with Scan and Raw View tabs
-        self.notebook = ttk.Notebook(self.content_frame)
-        self.notebook.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
-        self.notebook.configure(width=420)
+        right_frame = tk.Frame(self.content_frame, bg=THEME["bg"])
+        self.content_pane.add(right_frame, minsize=520, stretch="always")
+        self.notebook = ttk.Notebook(right_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        self.notebook.configure(width=560)
 
         scan_tab = tk.Frame(self.notebook, bg=THEME["bg"])
         self.notebook.add(scan_tab, text="Scan")
@@ -1386,8 +1874,8 @@ class N2NgApp:
         self.right_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.right_inner_frame = tk.Frame(self.right_canvas, bg=THEME["bg"], width=420)
-        self.right_canvas_window = self.right_canvas.create_window((0, 0), window=self.right_inner_frame, anchor=tk.NW, width=420)
+        self.right_inner_frame = tk.Frame(self.right_canvas, bg=THEME["bg"])
+        self.right_canvas_window = self.right_canvas.create_window((0, 0), window=self.right_inner_frame, anchor=tk.NW)
 
         def _on_frame_configure(event=None):
             self.right_canvas.configure(scrollregion=self.right_canvas.bbox("all"))
@@ -1517,16 +2005,60 @@ class N2NgApp:
         tk.OptionMenu(interval_frame, self.deauth_interval_var, "10", "30", "60").pack(side=tk.LEFT)
         tk.Label(interval_frame, text="seconds", bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT)
 
-        # Capture history
-        hist_frame = tk.LabelFrame(parent, text="Capture History", bg=THEME["panel"], fg=THEME["fg"])
+        # Capture sessions
+        hist_frame = tk.LabelFrame(parent, text="Capture Sessions", bg=THEME["panel"], fg=THEME["fg"])
+        self.capture_sessions_frame = hist_frame
         hist_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.history_list = tk.Listbox(hist_frame, bg=THEME["bg"], fg=THEME["fg"], selectmode=tk.EXTENDED)
-        self.history_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        hsb = tk.Scrollbar(hist_frame, command=self.history_list.yview)
-        hsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.history_list.config(yscrollcommand=hsb.set)
-        self.history_list.bind("<Button-3>", self._on_history_right_click)
-        tk.Button(hist_frame, text="Refresh", command=self._refresh_history, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.BOTTOM, fill=tk.X, pady=2)
+        self.capture_sessions_description = tk.Label(
+            hist_frame,
+            text="Select a capture to inspect, repair, convert, merge, or process with Hashcat.",
+            bg=THEME["panel"],
+            fg=THEME["fg"],
+            justify=tk.LEFT,
+            wraplength=560,
+        )
+        self.capture_sessions_description.pack(anchor=tk.W, padx=5, pady=(4, 2))
+
+        action_bar = tk.Frame(hist_frame, bg=THEME["panel"])
+        action_bar.pack(fill=tk.X, padx=4, pady=2)
+        self.inspect_btn = tk.Button(action_bar, text="Inspect", command=self._inspect_selected_capture, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
+        self.convert_btn = tk.Button(action_bar, text="Convert to 22000", command=self._convert_selected_to_22000, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
+        self.fix_btn = tk.Button(action_bar, text="Fix Capture", command=self._fix_selected_capture, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
+        self.merge_btn = tk.Button(action_bar, text="Merge", command=self._merge_selected, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
+        self.hashcat_btn = tk.Button(action_bar, text="Hashcat", command=self._open_hashcat_for_selection, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
+        self.more_btn = tk.Button(action_bar, text="More", command=self._show_history_actions_menu, bg=THEME["panel"], fg=THEME["fg"])
+        for button in (self.inspect_btn, self.convert_btn, self.fix_btn, self.merge_btn, self.hashcat_btn, self.more_btn):
+            button.pack(side=tk.LEFT, padx=2)
+        tk.Button(action_bar, text="Refresh", command=self._refresh_history, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.RIGHT, padx=2)
+
+        self.history_empty_var = tk.StringVar(value="Tip: Select a file to reveal available actions. Right-click is also supported.")
+        tk.Label(hist_frame, textvariable=self.history_empty_var, bg=THEME["panel"], fg=THEME["warn"], justify=tk.LEFT, wraplength=560).pack(anchor=tk.W, padx=5, pady=(2, 2))
+
+        history_body = tk.Frame(hist_frame, bg=THEME["panel"])
+        history_body.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
+        columns = ("name", "type", "size", "path")
+        self.history_tree = ttk.Treeview(history_body, columns=columns, show="headings", selectmode="extended", height=7)
+        for col, heading, width in (
+            ("name", "File", 180),
+            ("type", "Type", 70),
+            ("size", "Size", 80),
+            ("path", "Full path", 420),
+        ):
+            self.history_tree.heading(col, text=heading)
+            self.history_tree.column(col, width=width, stretch=col == "path")
+        self.history_vscroll = ttk.Scrollbar(history_body, orient=tk.VERTICAL, command=self.history_tree.yview)
+        self.history_hscroll = ttk.Scrollbar(history_body, orient=tk.HORIZONTAL, command=self.history_tree.xview)
+        self.history_tree.configure(yscrollcommand=self.history_vscroll.set, xscrollcommand=self.history_hscroll.set)
+        self.history_tree.grid(row=0, column=0, sticky="nsew")
+        self.history_vscroll.grid(row=0, column=1, sticky="ns")
+        self.history_hscroll.grid(row=1, column=0, sticky="ew")
+        history_body.grid_rowconfigure(0, weight=1)
+        history_body.grid_columnconfigure(0, weight=1)
+        self.history_tree.bind("<Button-3>", self._on_history_right_click)
+        self.history_tree.bind("<<TreeviewSelect>>", lambda _event=None: self._update_history_selection())
+
+        self.history_details = tk.Text(hist_frame, height=7, bg=THEME["bg"], fg=THEME["fg"], wrap=tk.NONE, state=tk.DISABLED)
+        self.history_details.pack(fill=tk.X, padx=4, pady=(2, 4))
 
     def _toggle_legacy(self):
         if self.legacy_visible.get():
@@ -1565,6 +2097,7 @@ class N2NgApp:
     def _check_dependencies(self):
         statuses = DependencyChecker.check_all()
         missing = [name for name, status in statuses.items() if not status["installed"]]
+        unusable = [name for name, status in statuses.items() if status["installed"] and not status.get("usable", True)]
         if missing:
             names = ", ".join(missing)
             install_lines = "\n".join(statuses[name]["apt"] for name in missing)
@@ -1575,6 +2108,9 @@ class N2NgApp:
             )
             self._log(f"Missing dependencies: {names}")
             messagebox.showwarning("N2-ng Dependencies", msg)
+        elif unusable:
+            names = ", ".join(f"{name}: {statuses[name].get('runtime_status', 'unusable')}" for name in unusable)
+            self._log(f"Dependencies installed with runtime limitations: {names}")
         else:
             self._log("All dependencies satisfied")
 
@@ -1994,76 +2530,341 @@ class N2NgApp:
         messagebox.showinfo(title, f"{title}\n\nFile: {path}")
         self._refresh_history()
 
-    def _refresh_history(self):
-        self.history_list.delete(0, tk.END)
+    def _history_file_type(self, path: Path) -> str:
+        if is_hashcat_22000_file(path):
+            return "22000"
+        suffix = path.suffix.lower().lstrip(".")
+        return suffix.upper() if suffix else "file"
+
+    def _set_history_items(self, paths: list[Path], select_path: Path | None = None):
+        self.history_tree.delete(*self.history_tree.get_children())
+        self._history_paths = {}
+        for path in sorted(paths):
+            try:
+                size = human_size(path.stat().st_size)
+            except OSError:
+                size = "?"
+            item = self.history_tree.insert("", tk.END, values=(path.name, self._history_file_type(path), size, str(path)))
+            self._history_paths[item] = path
+            if select_path and path == select_path:
+                self.history_tree.selection_set(item)
+                self.history_tree.focus(item)
+                self.history_tree.see(item)
+        if paths:
+            self.history_empty_var.set("Tip: Select a file to reveal available actions. Right-click is also supported.")
+        else:
+            self.history_empty_var.set(
+                "No capture files are available.\nCompleted captures and generated .22000 files will appear here for inspection, conversion, repair, merge, or Hashcat."
+            )
+        self._update_history_selection()
+
+    def _refresh_history(self, select_path: Path | None = None):
         base = capture_root()
         if not base.exists():
+            self._set_history_items([], select_path)
             return
-        for cap in sorted(base.rglob("*.cap")):
-            self.history_list.insert(tk.END, str(cap))
+        captures = []
+        for pattern in ("*.cap", "*.pcap", "*.pcapng", "*.22000"):
+            captures.extend(base.rglob(pattern))
+        self._set_history_items(list(set(captures)), select_path)
+
+    def _history_selected_paths(self) -> list[Path]:
+        return [self._history_paths[item] for item in self.history_tree.selection() if item in self._history_paths]
+
+    def _primary_history_path(self) -> Path | None:
+        selected = self._history_selected_paths()
+        return selected[0] if selected else None
+
+    def _can_merge_captures(self, caps: list[Path]) -> bool:
+        return len(caps) >= 2 and all(is_supported_capture(cap) for cap in caps)
+
+    def _selected_hash_path(self) -> Path | None:
+        primary = self._primary_history_path()
+        if not primary:
+            return None
+        if is_hashcat_22000_file(primary):
+            return primary if hashcat_22000_info(primary)["valid"] else None
+        related = primary.with_suffix(".22000")
+        if related.exists() and hashcat_22000_info(related)["valid"]:
+            return related
+        return None
+
+    def _history_details_text(self, path: Path | None) -> str:
+        if not path:
+            return "No file selected."
+        lines = [
+            f"Filename: {path.name}",
+            f"Full path: {path}",
+            f"File type: {self._history_file_type(path)}",
+        ]
+        try:
+            stat = path.stat()
+            lines.append(f"File size: {human_size(stat.st_size)}")
+            lines.append(f"Modified: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))}")
+        except OSError as exc:
+            lines.append(f"Status: Cannot stat file: {exc}")
+        if is_hashcat_22000_file(path):
+            info = hashcat_22000_info(path)
+            lines.append(f"Hashcat 22000 records: {info['records']}")
+            if info["types"]:
+                lines.append(f"Record types: {', '.join(info['types'])}")
+            else:
+                lines.append("Hash status: No valid PMKID/EAPOL records found")
+        elif is_supported_capture(path):
+            related = path.with_suffix(".22000")
+            if related.exists():
+                info = hashcat_22000_info(related)
+                lines.append(f"Related .22000: {related}")
+                lines.append(f"Related records: {info['records']}")
+            else:
+                lines.append("Related .22000: Not generated yet")
+            lines.append("Conversion: hcxpcapngtool extracts WPA PMKID/EAPOL records for Hashcat mode 22000.")
+        if self._last_history_result:
+            lines.append(f"Last result: {self._last_history_result}")
+        return "\n".join(lines)
+
+    def _set_history_details(self, text: str):
+        self.history_details.config(state=tk.NORMAL)
+        self.history_details.delete("1.0", tk.END)
+        self.history_details.insert(tk.END, text)
+        self.history_details.config(state=tk.DISABLED)
+
+    def _update_history_selection(self):
+        selected = self._history_selected_paths()
+        primary = selected[0] if selected else None
+        is_capture = bool(primary and is_supported_capture(primary))
+        is_hash = bool(primary and is_hashcat_22000_file(primary))
+        has_hash = self._selected_hash_path() is not None
+        self.inspect_btn.config(state=tk.NORMAL if primary else tk.DISABLED)
+        self.convert_btn.config(state=tk.NORMAL if is_capture else tk.DISABLED)
+        self.fix_btn.config(state=tk.NORMAL if is_capture else tk.DISABLED)
+        self.merge_btn.config(state=tk.NORMAL if self._can_merge_captures(selected) else tk.DISABLED)
+        self.hashcat_btn.config(state=tk.NORMAL if (is_hash or has_hash) else tk.DISABLED)
+        self._set_history_details(self._history_details_text(primary))
+
+    def _build_history_actions_menu(self, primary_cap: Path | None = None) -> tk.Menu:
+        selected = self._history_selected_paths()
+        primary = primary_cap or (selected[0] if selected else None)
+        is_capture = bool(primary and is_supported_capture(primary))
+        is_hash = bool(primary and is_hashcat_22000_file(primary))
+        inspect_state = tk.NORMAL if primary else tk.DISABLED
+        convert_state = tk.NORMAL if is_capture else tk.DISABLED
+        fix_state = tk.NORMAL if is_capture else tk.DISABLED
+        hashcat_state = tk.NORMAL if (is_hash or self._selected_hash_path()) else tk.DISABLED
+        content_state = tk.NORMAL if (is_hash or self._selected_hash_path()) else tk.DISABLED
+        merge_state = tk.NORMAL if self._can_merge_captures(selected) else tk.DISABLED
+
+        menu = tk.Menu(self.root, tearoff=0, bg=THEME["panel"], fg=THEME["fg"])
+        menu.add_command(label="Inspect", state=inspect_state, command=self._inspect_selected_capture)
+        menu.add_command(label="Convert to 22000", state=convert_state, command=self._convert_selected_to_22000)
+        menu.add_command(
+            label="Copy hashcat command",
+            state=content_state,
+            command=lambda cap=primary: self._copy_hashcat_cmd(cap) if cap else None,
+        )
+        menu.add_command(
+            label="Copy .22000 content",
+            state=content_state,
+            command=lambda cap=primary: self._copy_22000(cap) if cap else None,
+        )
+        menu.add_command(
+            label="Fix capture",
+            state=fix_state,
+            command=lambda cap=primary: self._fix_capture(cap) if cap else None,
+        )
+        menu.add_command(label="Normalize to PCAPNG", state=convert_state, command=self._normalize_selected_to_pcapng)
+        menu.add_command(label="Reconstruct CAP from Hash", state=tk.NORMAL if is_hash else tk.DISABLED, command=self._reconstruct_selected_hash)
+        menu.add_command(label="Hashcat", state=hashcat_state, command=self._open_hashcat_for_selection)
+        menu.add_command(label="Copy path", state=inspect_state, command=self._copy_selected_path)
+        menu.add_command(label="Merge selected", state=merge_state, command=self._merge_selected)
+        return menu
+
+    def _show_history_actions_menu(self):
+        menu = self._build_history_actions_menu()
+        x = self.history_actions_btn.winfo_rootx()
+        y = self.history_actions_btn.winfo_rooty() + self.history_actions_btn.winfo_height()
+        self._post_context_menu(menu, x, y)
 
     def _on_history_right_click(self, event):
-        idx = self.history_list.nearest(event.y)
-        if idx < 0:
+        item = self.history_tree.identify_row(event.y)
+        if not item:
             return
-        self.history_list.selection_clear(0, tk.END)
-        self.history_list.selection_set(idx)
-        cap_path = Path(self.history_list.get(idx))
-        menu = tk.Menu(self.root, tearoff=0, bg=THEME["panel"], fg=THEME["fg"])
-        menu.add_command(label="Copy hashcat command", command=lambda: self._copy_hashcat_cmd(cap_path))
-        menu.add_command(label="Copy .22000 content", command=lambda: self._copy_22000(cap_path))
-        menu.add_command(label="Fix capture", command=lambda: self._fix_capture(cap_path))
-        menu.add_command(label="Merge selected", command=self._merge_selected)
+        if item not in self.history_tree.selection():
+            self.history_tree.selection_set(item)
+        self.history_tree.focus(item)
+        self._update_history_selection()
+        cap_path = self._history_paths[item]
+        menu = self._build_history_actions_menu(cap_path)
         self._post_context_menu(menu, event.x_root, event.y_root)
+        return "break"
 
-    def _copy_hashcat_cmd(self, cap: Path):
+    def _inspect_selected_capture(self):
+        primary = self._primary_history_path()
+        self._set_history_details(self._history_details_text(primary))
+        if primary:
+            self.status.config(text=f"Inspected {primary.name}", bg=THEME["panel"], fg=THEME["fg"])
+
+    def _remember_history_result(self, result: CaptureProcessResult):
+        self._last_history_result = result.message
+        if result.record_count:
+            self._last_history_result += f" ({result.record_count} record(s))"
+        self.status.config(text=self._last_history_result, bg=THEME["panel"], fg=THEME["fg"])
+
+    def _complete_history_operation(self, result: CaptureProcessResult):
+        current = self._primary_history_path()
+        self._remember_history_result(result)
+        if not result.ok:
+            self._update_history_selection()
+            return
+        select_path = None
+        if result.output and result.output.exists():
+            select_path = result.output
+        elif current and current.exists():
+            select_path = current
+        self._refresh_history(select_path=select_path)
+
+    def _convert_selected_to_22000(self):
+        primary = self._primary_history_path()
+        if not primary or not is_supported_capture(primary):
+            return
+        dialog = ConversionDialog(self.root, primary, self.capture_manager, mode="22000")
+        self.root.wait_window(dialog)
+        if dialog.result:
+            self._complete_history_operation(dialog.result)
+
+    def _normalize_selected_to_pcapng(self):
+        primary = self._primary_history_path()
+        if not primary or not is_supported_capture(primary):
+            return
+        dialog = ConversionDialog(self.root, primary, self.capture_manager, mode="pcapng")
+        self.root.wait_window(dialog)
+        if dialog.result:
+            self._complete_history_operation(dialog.result)
+
+    def _fix_selected_capture(self):
+        primary = self._primary_history_path()
+        if primary and is_supported_capture(primary):
+            self._fix_capture(primary)
+
+    def _copy_selected_path(self):
+        primary = self._primary_history_path()
+        if primary:
+            self._copy_to_clipboard(str(primary))
+            self.status.config(text=f"Copied path for {primary.name}", bg=THEME["panel"], fg=THEME["fg"])
+
+    def _reconstruct_selected_hash(self):
+        primary = self._primary_history_path()
+        if not primary or not is_hashcat_22000_file(primary):
+            return
+        warning = (
+            "This creates a reconstructed capture from hash material.\n\n"
+            "It is not the original packet capture. Original packets, timing, metadata, unrelated traffic, "
+            "and other information cannot necessarily be restored."
+        )
+        if not messagebox.askokcancel("N2-ng", warning):
+            return
+        result = self.capture_manager.reconstruct_cap_from_hash(primary)
+        if result.ok and result.output:
+            messagebox.showinfo("N2-ng", f"Reconstructed synthetic CAP saved to:\n{result.output}")
+            self._complete_history_operation(result)
+        else:
+            self._complete_history_operation(result)
+            messagebox.showwarning("N2-ng", self._process_result_details(result))
+
+    def _open_hashcat_for_selection(self):
+        hash_file = self._selected_hash_path()
+        if not hash_file:
+            messagebox.showwarning("N2-ng", "Select a valid .22000 file or a capture with a related valid .22000 file.")
+            return
+        if self.hashcat_dialog and self.hashcat_dialog.winfo_exists():
+            self.hashcat_dialog.lift()
+            return
+        self.hashcat_dialog = HashcatDialog(self.root, hash_file)
+
+    def _ensure_22000_file(self, cap: Path) -> Path | None:
         hash22000 = cap.with_suffix(".22000")
         if not hash22000.exists():
             converted = self.capture_manager.convert(cap) if self.capture_manager else None
             if not converted:
                 messagebox.showwarning("N2-ng", "No .22000 file found and conversion failed.")
-                return
+                return None
             hash22000 = converted
-        cmd = f"hashcat -m 22000 {hash22000} /usr/share/wordlists/rockyou.txt"
+        try:
+            text = hash22000.read_text(errors="ignore")
+        except OSError as exc:
+            messagebox.showwarning("N2-ng", f"Could not read .22000 file:\n{exc}")
+            return None
+        if not has_hashcat_22000_content(text):
+            messagebox.showwarning("N2-ng", "No valid Hashcat 22000 handshake or PMKID data was found.")
+            return None
+        return hash22000
+
+    def _copy_hashcat_cmd(self, cap: Path):
+        hash22000 = self._ensure_22000_file(cap)
+        if not hash22000:
+            return
+        wordlist = default_hashcat_wordlist() or Path("<wordlist>")
+        parts = build_hashcat_command(hash22000, wordlist)
+        cmd = " ".join(shlex.quote(part) for part in parts)
         self._copy_to_clipboard(cmd)
+        self.status.config(text=f"Copied hashcat command for {cap.name}", bg=THEME["panel"], fg=THEME["fg"])
         self._log(f"Copied hashcat command for {cap.name}")
 
     def _copy_22000(self, cap: Path):
-        hash22000 = cap.with_suffix(".22000")
-        if not hash22000.exists():
-            converted = self.capture_manager.convert(cap) if self.capture_manager else None
-            if not converted:
-                messagebox.showwarning("N2-ng", "No .22000 file found and conversion failed.")
-                return
-            hash22000 = converted
+        hash22000 = self._ensure_22000_file(cap)
+        if not hash22000:
+            return
         text = hash22000.read_text(errors="ignore")
         self._copy_to_clipboard(text)
+        self.status.config(text=f"Copied .22000 content for {cap.name}", bg=THEME["panel"], fg=THEME["fg"])
         self._log(f"Copied .22000 content for {cap.name}")
+
+    def _process_result_details(self, result: CaptureProcessResult) -> str:
+        lines = [result.message]
+        if result.returncode is not None:
+            lines.append(f"Exit code: {result.returncode}")
+        if result.stderr.strip():
+            lines.append(f"stderr:\n{result.stderr.strip()}")
+        elif result.stdout.strip():
+            lines.append(f"stdout:\n{result.stdout.strip()}")
+        return "\n\n".join(lines)
 
     def _fix_capture(self, cap: Path):
         if not self.capture_manager:
             return
-        fixed = self.capture_manager.fix(cap)
-        if fixed:
-            messagebox.showinfo("N2-ng", f"Fixed capture saved to:\n{fixed}")
-            self._log(f"Fixed {cap.name} -> {fixed.name}")
-            self._refresh_history()
+        result = self.capture_manager.fix(cap)
+        if result.ok and result.output:
+            messagebox.showinfo("N2-ng", f"Fixed capture saved to:\n{result.output}")
+            self._log(f"Fixed {cap.name} -> {result.output.name}")
+            self._complete_history_operation(result)
         else:
-            messagebox.showwarning("N2-ng", "pcapfix failed or not installed.")
+            self._complete_history_operation(result)
+            messagebox.showwarning("N2-ng", self._process_result_details(result))
 
     def _merge_selected(self):
-        indices = self.history_list.curselection()
-        if len(indices) < 2:
+        caps = self._history_selected_paths()
+        if len(caps) < 2:
             messagebox.showwarning("N2-ng", "Select at least two captures to merge.")
             return
-        caps = [Path(self.history_list.get(i)) for i in indices]
-        out = caps[0].with_suffix(".merged.cap")
-        if self.capture_manager and self.capture_manager.merge(caps, out):
-            messagebox.showinfo("N2-ng", f"Merged capture saved to:\n{out}")
-            self._log(f"Merged {len(caps)} captures -> {out.name}")
-            self._refresh_history()
+        if not self._can_merge_captures(caps):
+            messagebox.showwarning("N2-ng", "Only .cap, .pcap, and .pcapng captures can be merged.")
+            return
+        if any(cap.suffix.lower() == ".pcapng" for cap in caps):
+            warning = (
+                "Merging PCAPNG files can discard or alter capture metadata, including information that may help hash extraction.\n\n"
+                "Original files will remain intact. Continue with mergecap?"
+            )
+            if not messagebox.askokcancel("N2-ng", warning):
+                return
+        out = merged_capture_output_path(caps)
+        result = self.capture_manager.merge(caps, out) if self.capture_manager else CaptureProcessResult(False, message="Capture manager is not available.")
+        if result.ok and result.output:
+            messagebox.showinfo("N2-ng", f"Merged capture saved to:\n{result.output}")
+            self._log(f"Merged {len(caps)} captures -> {result.output.name}")
+            self._complete_history_operation(result)
         else:
-            messagebox.showwarning("N2-ng", "mergecap failed or not installed.")
+            self._complete_history_operation(result)
+            messagebox.showwarning("N2-ng", self._process_result_details(result))
 
     def _update_clients(self, clients: list[dict]):
         self.clients = clients

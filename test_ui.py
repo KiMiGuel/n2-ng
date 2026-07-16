@@ -266,6 +266,266 @@ def test_context_menu_dismissal_destroys_active_menu():
     root.destroy()
 
 
+def test_history_right_click_preserves_existing_selection():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app._post_context_menu = Mock()
+    app._set_history_items([Path("/tmp/one.cap"), Path("/tmp/two.cap"), Path("/tmp/three.cap")])
+    items = app.history_tree.get_children()
+    app.history_tree.selection_set(items[:2])
+    app.history_tree.identify_row = Mock(return_value=items[1])
+
+    app._on_history_right_click(types.SimpleNamespace(y=0, x_root=0, y_root=0))
+
+    assert app.history_tree.selection() == items[:2]
+    root.destroy()
+
+
+def test_history_right_click_unselected_row_selects_only_that_row():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app._post_context_menu = Mock()
+    app._set_history_items([Path("/tmp/one.cap"), Path("/tmp/two.cap"), Path("/tmp/three.cap")])
+    items = app.history_tree.get_children()
+    app.history_tree.selection_set(items[:2])
+    app.history_tree.identify_row = Mock(return_value=items[2])
+
+    app._on_history_right_click(types.SimpleNamespace(y=0, x_root=0, y_root=0))
+
+    assert app.history_tree.selection() == (items[2],)
+    root.destroy()
+
+
+def test_history_action_menu_disables_merge_until_two_compatible_captures():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app._set_history_items([Path("/tmp/one.cap")])
+    app.history_tree.selection_set(app.history_tree.get_children()[0])
+
+    menu = app._build_history_actions_menu()
+    labels = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)]
+    merge_index = labels.index("Merge selected")
+
+    assert menu.entrycget(merge_index, "state") == tk.DISABLED
+    menu.destroy()
+
+    app._set_history_items([Path("/tmp/one.cap"), Path("/tmp/two.pcapng")])
+    app.history_tree.selection_set(app.history_tree.get_children())
+    menu = app._build_history_actions_menu()
+    labels = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)]
+    merge_index = labels.index("Merge selected")
+
+    assert menu.entrycget(merge_index, "state") == tk.NORMAL
+    menu.destroy()
+    root.destroy()
+
+
+def test_capture_sessions_panel_has_visible_workflow_controls():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+
+    assert app.capture_sessions_frame.cget("text") == "Capture Sessions"
+    assert "Select a capture" in app.capture_sessions_description.cget("text")
+    assert app.inspect_btn.cget("text") == "Inspect"
+    assert app.convert_btn.cget("text") == "Convert to 22000"
+    assert app.fix_btn.cget("text") == "Fix Capture"
+    assert app.merge_btn.cget("text") == "Merge"
+    assert app.hashcat_btn.cget("text") == "Hashcat"
+    assert app.more_btn.cget("text") == "More"
+    root.destroy()
+
+
+def test_capture_sessions_lists_22000_and_updates_details(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    cap = tmp_path / "capture.cap"
+    hash_file = tmp_path / "capture.22000"
+    cap.write_bytes(b"pcap")
+    hash_file.write_text("WPA*01*abc\nWPA*02*def\n")
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
+
+    app._refresh_history(select_path=hash_file)
+
+    values = [app.history_tree.item(item, "values") for item in app.history_tree.get_children()]
+    assert any(Path(row[3]) == hash_file for row in values)
+    details = app.history_details.get("1.0", tk.END)
+    assert "Hashcat 22000 records: 2" in details
+    assert str(hash_file) in details
+    root.destroy()
+
+
+def test_capture_sessions_empty_state(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
+
+    app._refresh_history()
+
+    assert "No capture files" in app.history_empty_var.get()
+    root.destroy()
+
+
+def test_capture_action_states_for_hash_and_capture_files(tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    cap = tmp_path / "capture.cap"
+    hash_file = tmp_path / "capture.22000"
+    cap.write_bytes(b"pcap")
+    hash_file.write_text("WPA*02*abc\n")
+    app._set_history_items([cap, hash_file])
+
+    cap_item = next(item for item in app.history_tree.get_children() if Path(app.history_tree.item(item, "values")[3]) == cap)
+    app.history_tree.selection_set(cap_item)
+    app._update_history_selection()
+    assert str(app.convert_btn.cget("state")) == tk.NORMAL
+    assert str(app.fix_btn.cget("state")) == tk.NORMAL
+
+    hash_item = next(item for item in app.history_tree.get_children() if Path(app.history_tree.item(item, "values")[3]) == hash_file)
+    app.history_tree.selection_set(hash_item)
+    app._update_history_selection()
+    assert str(app.convert_btn.cget("state")) == tk.DISABLED
+    assert str(app.fix_btn.cget("state")) == tk.DISABLED
+    assert str(app.hashcat_btn.cget("state")) == tk.NORMAL
+    root.destroy()
+
+
+def test_capture_sessions_have_horizontal_scrollbar_and_paned_layout():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+
+    assert app.content_pane.winfo_class() == "Panedwindow"
+    assert str(app.history_hscroll.cget("orient")) == tk.HORIZONTAL
+    assert app.history_tree.cget("xscrollcommand")
+    root.destroy()
+
+
+def test_hashcat_dialog_stops_running_process(tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    hash_file = tmp_path / "capture.22000"
+    hash_file.write_text("WPA*02*abc\n")
+    dialog = _n2ng.HashcatDialog(root, hash_file)
+    proc = Mock()
+    proc.poll.return_value = None
+    dialog.proc = proc
+
+    dialog._stop()
+
+    proc.terminate.assert_called_once()
+    dialog.destroy()
+    root.destroy()
+
+
+def test_history_success_completion_refreshes_and_selects_output(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    original = tmp_path / "one.cap"
+    output = tmp_path / "one.merged.cap"
+    original.write_bytes(b"one")
+    output.write_bytes(b"merged")
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
+    app._refresh_history(select_path=original)
+
+    app._complete_history_operation(_n2ng.CaptureProcessResult(True, output=output, message="merged"))
+
+    selected = app._history_selected_paths()
+    assert selected == [output]
+    assert str(output) in app.history_details.get("1.0", tk.END)
+    root.destroy()
+
+
+def test_history_failed_completion_preserves_selection(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    original = tmp_path / "one.cap"
+    original.write_bytes(b"one")
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
+    app._refresh_history(select_path=original)
+
+    app._complete_history_operation(_n2ng.CaptureProcessResult(False, message="failed"))
+
+    assert app._history_selected_paths() == [original]
+    root.destroy()
+
+
+def test_merge_success_refreshes_and_selects_merged_output(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    cap1 = tmp_path / "one.cap"
+    cap2 = tmp_path / "two.cap"
+    out = tmp_path / "one.merged.cap"
+    cap1.write_bytes(b"one")
+    cap2.write_bytes(b"two")
+    out.write_bytes(b"merged")
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
+    monkeypatch.setattr(_n2ng, "merged_capture_output_path", lambda _caps: out)
+    monkeypatch.setattr(_n2ng.messagebox, "showinfo", lambda *_args, **_kwargs: None)
+    app.capture_manager.merge = Mock(return_value=_n2ng.CaptureProcessResult(True, output=out, message="merged"))
+    app._refresh_history()
+    input_items = [
+        item for item in app.history_tree.get_children()
+        if Path(app.history_tree.item(item, "values")[3]) in {cap1, cap2}
+    ]
+    app.history_tree.selection_set(input_items)
+
+    app._merge_selected()
+
+    assert app._history_selected_paths() == [out]
+    root.destroy()
+
+
+def test_copy_hashcat_command_quotes_paths_and_existing_wordlist(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    cap = tmp_path / "capture with space.cap"
+    hash_file = tmp_path / "capture with space.22000"
+    cap.write_bytes(b"pcap")
+    hash_file.write_text("WPA*02*abc\n")
+    monkeypatch.setattr(_n2ng, "default_hashcat_wordlist", lambda: Path("/word lists/rockyou.txt"))
+
+    app._copy_hashcat_cmd(cap)
+
+    copied = root.clipboard_get()
+    assert copied == (
+        "hashcat -m 22000 -a 0 "
+        + _n2ng.shlex.quote(str(hash_file))
+        + " "
+        + _n2ng.shlex.quote("/word lists/rockyou.txt")
+    )
+    assert "Copied hashcat command" in app.status.cget("text")
+    root.destroy()
+
+
+def test_copy_22000_rejects_invalid_content(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    cap = tmp_path / "capture.cap"
+    hash_file = tmp_path / "capture.22000"
+    cap.write_bytes(b"pcap")
+    hash_file.write_text("not hashcat 22000 content\n")
+    warnings = []
+    monkeypatch.setattr(_n2ng.messagebox, "showwarning", lambda title, msg: warnings.append((title, msg)))
+
+    app._copy_22000(cap)
+
+    assert warnings
+    assert "No valid Hashcat 22000" in warnings[0][1]
+    root.destroy()
+
+
 def test_treeview_uses_dark_theme():
     """Treeview background must be dark so bright foreground text is visible."""
     root = tk.Tk()
@@ -476,7 +736,8 @@ def test_main_content_grid_expands_with_window():
     assert root.grid_columnconfigure(0)["weight"] == 1
     assert app.content_frame.grid_rowconfigure(0)["weight"] == 1
     assert app.content_frame.grid_columnconfigure(0)["weight"] == 1
-    assert app.content_frame.grid_columnconfigure(1)["weight"] == 1
+    assert app.content_pane.winfo_class() == "Panedwindow"
+    assert len(app.content_pane.panes()) == 2
     root.destroy()
 
 
