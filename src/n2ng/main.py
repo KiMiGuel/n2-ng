@@ -518,7 +518,7 @@ class DependencySplash(tk.Toplevel):
             fg=THEME["fg"],
             font=("TkDefaultFont", 12, "bold"),
         ).pack(anchor=tk.W, padx=12, pady=(12, 6))
-        self.text = tk.Text(self, bg=THEME["bg"], fg=THEME["fg"], height=20, width=72, state=tk.DISABLED
+        self.text = tk.Text(self, bg=THEME["bg"], fg=THEME["fg"], height=20, width=72, state=tk.DISABLED)
         self.text.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
         self.hint = tk.Label(self, text="", bg=THEME["bg"], fg=THEME["warn"])
         self.hint.pack(anchor=tk.W, padx=12, pady=(0, 12))
