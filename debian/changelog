@@ -1,3 +1,11 @@
+n2-ng (0.1.1-1) kali-rolling; urgency=medium
+
+  * Improve responsive UI sizing and adapter refresh typography.
+  * Harden worker cleanup, queued UI updates, and capture command timeouts.
+  * Remove the duplicate module import warning and update the launcher version.
+
+ -- KiMiGuEL — INDEPENTEST <Indepentest@gmail.com>  Mon, 20 Jul 2026 08:00:00 -0700
+
 n2-ng (0.1.0-2) kali-rolling; urgency=medium
 
   * Fix beacons display in scan results.

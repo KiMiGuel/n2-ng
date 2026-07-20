@@ -1,5 +1,13 @@
 """N2-ng package."""
 
-from .main import main as run
+__version__ = "0.1.1"
 
-__all__ = ["run"]
+__all__ = ["run", "__version__"]
+
+
+def __getattr__(name):
+    if name == "run":
+        from .main import main
+
+        return main
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

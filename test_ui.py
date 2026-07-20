@@ -84,6 +84,25 @@ def test_toolbar_selectors_use_readonly_comboboxes():
     assert app.band_combo.winfo_class() == "TCombobox"
     assert str(app.adapter_combo.cget("state")) == "readonly"
     assert str(app.band_combo.cget("state")) == "readonly"
+    assert str(app.refresh_adapters_btn.cget("font")) == str(app._ui_font)
+    root.destroy()
+
+
+def test_window_resize_policy_allows_compact_layout():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+
+    assert root.minsize() == (900, 560)
+    root.geometry("900x560")
+    root.update_idletasks()
+    app._apply_responsive_fonts()
+    assert app._ui_font.cget("size") == 9
+
+    root.geometry("1600x900")
+    root.update_idletasks()
+    app._apply_responsive_fonts()
+    assert app._ui_font.cget("size") == 14
     root.destroy()
 
 
@@ -141,6 +160,7 @@ def test_network_tree_selection_loads_target_details():
     app._refresh_tree()
 
     # Simulate selecting the row (left-click / keyboard selection).
+    app._lock_channel = Mock()
     app.tree.selection_set(bssid)
     app._on_network_select()
 
@@ -428,20 +448,24 @@ def test_capture_sessions_panel_has_visible_workflow_controls():
     assert app.fix_btn.cget("text") == "Fix Capture"
     assert app.merge_btn.cget("text") == "Merge"
     assert app.hashcat_btn.cget("text") == "Hashcat"
-    assert app.reload_btn.cget("text") == "Reload"
     root.destroy()
 
 
-def test_capture_sessions_reload_button_refreshes_history():
+def test_capture_sessions_auto_refresh_schedules():
     root = tk.Tk()
     root.withdraw()
     app = _n2ng.N2NgApp(root)
-    app._refresh_history = Mock()
-    app.reload_btn.configure(command=app._refresh_history)
+    # Cancel the timer started by the app so it doesn't fire after the test.
+    if app._history_refresh_id is not None:
+        app.root.after_cancel(app._history_refresh_id)
+        app._history_refresh_id = None
 
-    app.reload_btn.invoke()
+    app._refresh_history = Mock()
+    app._schedule_history_refresh()
 
     app._refresh_history.assert_called_once()
+    assert app._history_refresh_id is not None
+    app.root.after_cancel(app._history_refresh_id)
     root.destroy()
 
 

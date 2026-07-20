@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # N2-ng launcher
 # Runs the Python GUI, which will prompt for sudo if not root.
-cd "$(dirname "$0")" || exit 1
-export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+N2NG_HOME="${N2NG_HOME:-$SCRIPT_DIR}"
+cd "$N2NG_HOME" || exit 1
+export PYTHONPATH="$N2NG_HOME/src${PYTHONPATH:+:$PYTHONPATH}"
 exec python3 -m n2ng.main "$@"

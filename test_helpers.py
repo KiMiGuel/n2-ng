@@ -13,6 +13,22 @@ format_bssid = _n2ng.format_bssid
 human_size = _n2ng.human_size
 
 
+def test_module_launch_has_no_duplicate_import_warning():
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent / "src")
+    result = subprocess.run(
+        [sys.executable, "-Werror::RuntimeWarning", "-m", "n2ng.main", "--version"],
+        cwd=Path(__file__).resolve().parent,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "n2-ng 0.1.1"
+    assert "RuntimeWarning" not in result.stderr
+
+
 def test_sanitize_essid():
     assert sanitize_essid("My WiFi", "AA:BB:CC:DD:EE:FF") == "My_WiFi_AA-BB-CC-DD-EE-FF"
     assert sanitize_essid("", "AA:BB:CC:DD:EE:FF") == "hidden_AA-BB-CC-DD-EE-FF"
