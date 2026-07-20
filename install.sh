@@ -52,4 +52,18 @@ else
     python3 -m pip install .
 fi
 
+# Add a convenient alias for the source-tree launcher when installing from git.
+add_alias() {
+    local user="${SUDO_USER:-$USER}"
+    local home
+    home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+    [ -z "$home" ] && return
+    local rc="$home/.bashrc"
+    local line="alias n2-ng='\$HOME/n2-ng/n2-ng'"
+    if [ -f "$rc" ] && ! grep -qxF "$line" "$rc" 2>/dev/null; then
+        printf '\n# N2-NG launcher alias\n%s\n' "$line" >> "$rc"
+    fi
+}
+add_alias
+
 echo "N2-NG installed. Launch with: n2-ng"

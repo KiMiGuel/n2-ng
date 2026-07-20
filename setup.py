@@ -1,9 +1,21 @@
+from pathlib import Path
+import re
+
 from setuptools import find_packages, setup
+
+
+def _read_version():
+    init = Path(__file__).resolve().parent / "src" / "n2ng" / "__init__.py"
+    text = init.read_text(encoding="utf-8")
+    match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', text, re.M)
+    if not match:
+        raise RuntimeError("Unable to find __version__ in src/n2ng/__init__.py")
+    return match.group(1)
 
 
 setup(
     name="n2-ng",
-    version="0.1.0",
+    version=_read_version(),
     description="Single-window GUI for the aircrack-ng suite",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",

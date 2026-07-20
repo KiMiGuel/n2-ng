@@ -27,7 +27,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 try:
     from . import __version__
 except ImportError:
-    __version__ = "0.1.0"
+    __version__ = "0.1.1"
 
 
 THEME = {
@@ -1239,13 +1239,13 @@ class CaptureManager:
         if hcx.installed:
             rc = subprocess.run(
                 [hcx.path, "-o", str(tmp), str(self.active_cap)],
-                capture_output=True, text=True
+                capture_output=True, text=True, timeout=120
             )
         elif shutil.which("aircrack-ng"):
             base = str(tmp.with_suffix(""))
             rc = subprocess.run(
                 ["aircrack-ng", str(self.active_cap), "-J", base],
-                capture_output=True, text=True
+                capture_output=True, text=True, timeout=120
             )
             tmp = Path(base + ".hccap")
         else:
@@ -1277,7 +1277,7 @@ class CaptureManager:
             return CaptureProcessResult(False, message=f"hcxpcapngtool is not installed. Install with: {hcx.apt}")
         out = hashcat_22000_output_path(cap)
         cmd = [hcx.path, "-o", str(out), str(cap)]
-        rc = subprocess.run(cmd, capture_output=True, text=True)
+        rc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         stdout = getattr(rc, "stdout", "")
         stderr = getattr(rc, "stderr", "")
         info = hashcat_22000_info(out) if out.exists() else {"valid": False, "records": 0, "types": ()}
@@ -1321,7 +1321,7 @@ class CaptureManager:
             return CaptureProcessResult(False, message=f"editcap is not installed. Install with: {editcap.apt}")
         out = pcapng_output_path(cap)
         cmd = [editcap.path, "-F", "pcapng", str(cap), str(out)]
-        rc = subprocess.run(cmd, capture_output=True, text=True)
+        rc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         stdout = getattr(rc, "stdout", "")
         stderr = getattr(rc, "stderr", "")
         if rc.returncode == 0 and out.exists() and out.stat().st_size > 0:
@@ -1339,7 +1339,7 @@ class CaptureManager:
             return CaptureProcessResult(False, message=f"hcxhash2cap is not installed. Install with: {hcxhash2cap.apt}")
         out = reconstructed_cap_output_path(hash_file)
         cmd = [hcxhash2cap.path, f"--pmkid-eapol={hash_file}", "-c", str(out)]
-        rc = subprocess.run(cmd, capture_output=True, text=True)
+        rc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         stdout = getattr(rc, "stdout", "")
         stderr = getattr(rc, "stderr", "")
         if rc.returncode == 0 and out.exists() and out.stat().st_size > 0:
@@ -1356,7 +1356,7 @@ class CaptureManager:
             return CaptureProcessResult(False, message=f"mergecap is not installed. Install with: {mergecap.apt}")
         output.parent.mkdir(parents=True, exist_ok=True)
         cmd = [mergecap.path, "-w", str(output)] + [str(c) for c in caps]
-        rc = subprocess.run(cmd, capture_output=True, text=True)
+        rc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         stdout = getattr(rc, "stdout", "")
         stderr = getattr(rc, "stderr", "")
         if rc.returncode == 0 and output.exists() and output.stat().st_size > 0:
@@ -1385,7 +1385,7 @@ class CaptureManager:
             return CaptureProcessResult(False, message=f"pcapfix is not installed. Install with: {pcapfix.apt}")
         out = fixed_capture_output_path(cap)
         cmd = [pcapfix.path, "-k", "-o", str(out), str(cap)]
-        rc = subprocess.run(cmd, capture_output=True, text=True)
+        rc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         stdout = getattr(rc, "stdout", "")
         stderr = getattr(rc, "stderr", "")
         if rc.returncode == 0 and out.exists() and out.stat().st_size > 0:
@@ -1846,7 +1846,7 @@ class N2NgApp:
         self.demo_mode = demo_mode
         self.root.title(f"N2-ng v{__version__}")
         self.root.geometry("1320x760")
-        self.root.minsize(1000, 600)
+        self.root.minsize(900, 560)
         self.root.configure(bg=THEME["bg"])
 
         self.queue = queue.Queue()
@@ -1864,6 +1864,9 @@ class N2NgApp:
         self.current_band = tk.StringVar(value="Both")
         self.adapter_var = tk.StringVar()
         self.poll_id = None
+        self._last_network_signature = None
+        self._last_client_signature = None
+        self._cleanup_done = False
         self._paused = False
         self._context_menu = None
         self._history_paths: dict[str, Path] = {}
@@ -1974,7 +1977,7 @@ class N2NgApp:
             return
         width = self.root.winfo_width()
         height = self.root.winfo_height()
-        size = max(8, min(16, min(width, height) // 60))
+        size = max(9, min(14, width // 110))
         self._ui_font.config(size=size)
         self._ui_font_bold.config(size=size)
         self._mono_font.config(size=size)
@@ -2022,12 +2025,12 @@ class N2NgApp:
 
         # Left: network tree
         left_frame = tk.Frame(self.content_frame, bg=THEME["bg"])
-        self.content_pane.add(left_frame, minsize=500, stretch="always")
+        self.content_pane.add(left_frame, minsize=380, stretch="always")
         self._build_network_tree(left_frame)
 
         # Right: notebook with Scan and Raw View tabs
         right_frame = tk.Frame(self.content_frame, bg=THEME["bg"])
-        self.content_pane.add(right_frame, minsize=520, stretch="always")
+        self.content_pane.add(right_frame, minsize=460, stretch="always")
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
@@ -2099,7 +2102,15 @@ class N2NgApp:
         self.stop_monitor_btn.pack(side=tk.LEFT, padx=5)
         self.wps_scan_btn = tk.Button(toolbar, text="WPS Scan", command=self._wps_scan, bg=THEME["panel"], fg=THEME["fg"])
         self.wps_scan_btn.pack(side=tk.LEFT, padx=5)
-        tk.Button(toolbar, text="Refresh Adapters", command=self._refresh_adapters, bg=THEME["panel"], fg=THEME["fg"], font=("TkDefaultFont", 7)).pack(side=tk.LEFT, padx=5)
+        self.refresh_adapters_btn = tk.Button(
+            toolbar,
+            text="Refresh Adapters",
+            command=self._refresh_adapters,
+            bg=THEME["panel"],
+            fg=THEME["fg"],
+            font=self._ui_font,
+        )
+        self.refresh_adapters_btn.pack(side=tk.LEFT, padx=5)
         tk.Button(toolbar, text="Settings", command=self._open_settings, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
 
         self.channel_pill = tk.Label(toolbar, text="SCANNING ALL", bg="red", fg="white", font=self._ui_font_bold)
@@ -2455,11 +2466,7 @@ class N2NgApp:
         tk.Button(self.wps_dialog, text="Stop", command=self._stop_wps_scan, bg=THEME["panel"], fg=THEME["fg"]).pack(pady=5)
 
     def _on_wps_event(self, event, payload):
-        if event == "wps_line":
-            self.wps_lines.append(payload)
-            self.root.after(0, self._update_wps_text)
-        elif event == "error":
-            self._log(f"WPS scan error: {payload}")
+        self.queue.put(("wps_line" if event == "wps_line" else "error", payload))
 
     def _update_wps_text(self):
         if hasattr(self, "wps_text") and self.wps_text.winfo_exists():
@@ -2942,8 +2949,14 @@ class N2NgApp:
         # Always refresh display from the shared buffer.
         if self.worker:
             networks, clients = self.worker.get_latest()
-            self._update_networks(networks)
-            self._update_clients(clients)
+            network_signature = tuple(tuple(sorted(net.items())) for net in networks)
+            client_signature = tuple(tuple(sorted(client.items())) for client in clients)
+            if network_signature != self._last_network_signature:
+                self._last_network_signature = network_signature
+                self._update_networks(networks)
+            if client_signature != self._last_client_signature:
+                self._last_client_signature = client_signature
+                self._update_clients(clients)
             self._check_channel_lock()
 
         # Drain asynchronous events.
@@ -2956,6 +2969,9 @@ class N2NgApp:
                 self._notify_capture("WPA Handshake Captured", payload["file"])
             elif event == "pmkid":
                 self._notify_capture("PMKID Captured", payload["file"])
+            elif event == "wps_line":
+                self.wps_lines.append(payload)
+                self._update_wps_text()
             elif event == "error":
                 self._log(f"ERROR: {payload}")
 
@@ -3509,15 +3525,20 @@ class N2NgApp:
         self.root.destroy()
 
     def _cleanup(self):
-        if self.poll_id:
-            self.root.after_cancel(self.poll_id)
-            self.poll_id = None
-        if self._resize_after_id is not None:
-            self.root.after_cancel(self._resize_after_id)
-            self._resize_after_id = None
-        if self._history_refresh_id is not None:
-            self.root.after_cancel(self._history_refresh_id)
-            self._history_refresh_id = None
+        if self._cleanup_done:
+            return
+        self._cleanup_done = True
+        for attr in ("poll_id", "_resize_after_id", "_history_refresh_id", "_channel_lock_timer_id"):
+            timer_id = getattr(self, attr, None)
+            if timer_id is not None:
+                try:
+                    self.root.after_cancel(timer_id)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
+        if hasattr(self, "wps_scanner"):
+            self.wps_scanner.stop()
+        self.attack.stop_current()
         self.worker.shutdown()
         self.airmon.cleanup()
 
