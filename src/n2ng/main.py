@@ -231,27 +231,35 @@ def unique_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}_{int(time.time())}{path.suffix}")
 
 
+def _organized_output_path(kind: str, filename: str) -> Path:
+    """Return a unique path under capture_root()/kind/YYYY-MM-DD/filename."""
+    date_dir = time.strftime("%Y-%m-%d")
+    path = capture_root() / kind / date_dir / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return unique_path(path)
+
+
 def fixed_capture_output_path(cap: Path) -> Path:
     suffix = cap.suffix if cap.suffix.lower() in VALID_CAPTURE_SUFFIXES else ".cap"
-    return unique_path(cap.with_name(f"{cap.stem}.fixed{suffix}"))
+    return _organized_output_path("fixed", f"{cap.stem}.fixed{suffix}")
 
 
 def pcapng_output_path(cap: Path) -> Path:
-    return unique_path(cap.with_name(f"{cap.stem}.pcapng"))
+    return _organized_output_path("pcapng", f"{cap.stem}.pcapng")
 
 
 def hashcat_22000_output_path(cap: Path) -> Path:
-    return unique_path(cap.with_suffix(".22000"))
+    return _organized_output_path("hashcat", f"{cap.stem}.22000")
 
 
 def reconstructed_cap_output_path(hash_file: Path) -> Path:
-    return unique_path(hash_file.with_name(f"{hash_file.stem}.reconstructed.cap"))
+    return _organized_output_path("reconstructed", f"{hash_file.stem}.reconstructed.cap")
 
 
 def merged_capture_output_path(caps: list[Path]) -> Path:
     first = caps[0]
     suffix = first.suffix if first.suffix.lower() in VALID_CAPTURE_SUFFIXES else ".pcapng"
-    return unique_path(first.with_name(f"{first.stem}.merged{suffix}"))
+    return _organized_output_path("merged", f"{first.stem}.merged{suffix}")
 
 
 def is_supported_capture(path: Path) -> bool:
@@ -569,17 +577,17 @@ class AirmonManager:
             for line in out.splitlines()[2:]:
                 parts = line.split()
                 # airmon-ng layout: phyN <iface> <driver> <chipset>
-                if len(parts) >= 2 and parts[1].startswith(("wlan", "wlp")) and not parts[1].endswith("mon"):
+                if len(parts) >= 2 and parts[1].startswith(("wlan", "wlp")):
                     result.append(parts[1])
         except Exception:
             pass
         try:
             out = subprocess.check_output(["ip", "link"], text=True, stderr=subprocess.DEVNULL)
             for line in out.splitlines():
-                m = re.search(r"^(?:\d+:\s+)?([ew]lan\d+|wlp\S+?):", line)
+                m = re.search(r"^(?:\d+:\s+)?([ew]lan\d+(?:mon)?|wlp\S+?):", line)
                 if m:
                     name = m.group(1)
-                    if name not in result and not name.endswith("mon"):
+                    if name not in result:
                         result.append(name)
         except Exception:
             pass
@@ -595,6 +603,10 @@ class AirmonManager:
             return False
 
     def start_monitor(self, iface: str) -> str:
+        # If the selected interface is already in monitor mode, use it directly.
+        if self._is_monitor(iface):
+            self._mon_map[iface] = iface
+            return iface
         # Stop any previous monitor for this iface
         self.stop_monitor_for_iface(iface)
         before = self._list_interfaces()
@@ -687,8 +699,8 @@ def parse_airodump_csv(text: str):
             "cipher": row.get("Cipher", "").strip(),
             "auth": row.get("Authentication", "").strip(),
             "power": row.get("Power", "").strip(),
-            "beacons": row.get("# Beacons", "").strip(),
-            "iv": row.get("# IV", "").strip(),
+            "beacons": (row.get("# Beacons", "") or row.get("#Beacons", "")).strip(),
+            "iv": (row.get("# IV", "") or row.get("#IV", "")).strip(),
             "id_len": row.get("ID-length", "").strip(),
             "manufacturer": row.get("Manufacturer", "").strip(),
             "essid": essid,
@@ -721,6 +733,19 @@ class Settings:
         "show_manufacturers": False,
         "filter_encryption": "All",
         "quiet_mode": False,
+        "auto_unlock_after_capture": False,
+        "col_visibility": {
+            "pwr": True,
+            "beacons": True,
+            "data": True,
+            "ch": True,
+            "mb": True,
+            "enc": True,
+            "cipher": True,
+            "auth": True,
+            "mfg": False,
+            "essid": True,
+        },
     }
 
     def __init__(self):
@@ -1712,6 +1737,10 @@ class SettingsDialog(tk.Toplevel):
             self.format_vars[fmt] = var
             tk.Checkbutton(fmt_frame, text=fmt, variable=var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).pack(side=tk.LEFT)
 
+        # Auto-unlock after capture
+        self.auto_unlock_var = tk.BooleanVar(value=self.settings.get("auto_unlock_after_capture"))
+        tk.Checkbutton(frame, text="Auto-unlock channel after capture", variable=self.auto_unlock_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=9, column=0, sticky=tk.W, columnspan=2)
+
         # Buttons
         btn_frame = tk.Frame(self, bg=THEME["bg"])
         btn_frame.pack(pady=10)
@@ -1731,6 +1760,7 @@ class SettingsDialog(tk.Toplevel):
             "filter_encryption": self.filter_var.get(),
             "write_interval": self.interval_var.get(),
             "output_formats": formats,
+            "auto_unlock_after_capture": self.auto_unlock_var.get(),
         }
         ok, error = self.apply_callback(proposed, self.pause_var.get())
         if ok:
@@ -1741,6 +1771,22 @@ class SettingsDialog(tk.Toplevel):
 
 class N2NgApp:
     """Main tkinter application."""
+
+    # Main network treeview columns: id, heading text, width, sort type, data key.
+    # sort_type: "numeric", "numeric_or_string", "alpha", or None (BSSID, not sortable).
+    NETWORK_COLUMNS = (
+        ("pwr", "PWR", 70, "numeric", "power"),
+        ("beacons", "Beacons", 80, "numeric", "beacons"),
+        ("data", "#Data", 70, "numeric", "iv"),
+        ("ch", "CH", 50, "numeric", "channel"),
+        ("mb", "MB", 60, "numeric_or_string", "speed"),
+        ("enc", "ENC", 70, "alpha", "privacy"),
+        ("cipher", "CIPHER", 80, "alpha", "cipher"),
+        ("auth", "AUTH", 80, "alpha", "auth"),
+        ("mfg", "MANU", 120, "alpha", "manufacturer"),
+        ("essid", "ESSID", 150, "alpha", "essid"),
+        ("bssid", "BSSID", 130, None, "bssid"),
+    )
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1769,6 +1815,20 @@ class N2NgApp:
         self._history_paths: dict[str, Path] = {}
         self._last_history_result = ""
         self.hashcat_dialog = None
+
+        # Column visibility / sorting state for the network tree.
+        self._col_visibility_vars: dict[str, tk.BooleanVar] = {}
+        self._col_headings: dict[str, str] = {}
+        self._sort_col: str | None = None
+        self._sort_reverse: bool = False
+        self._manual_sort_active: bool = False
+        self._selected_bssid: str | None = None
+
+        # Channel lock state.
+        self.channel_locked: bool = False
+        self.locked_channel: int | None = None
+        self._channel_lock_lost_at: float | None = None
+        self._channel_lock_timer_id: str | None = None
 
         self._configure_ttk_styles()
         self._build_ui()
@@ -1852,7 +1912,6 @@ class N2NgApp:
         self.content_pane.add(right_frame, minsize=520, stretch="always")
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
-        self.notebook.configure(width=560)
 
         scan_tab = tk.Frame(self.notebook, bg=THEME["bg"])
         self.notebook.add(scan_tab, text="Scan")
@@ -1914,6 +1973,8 @@ class N2NgApp:
         tk.Button(toolbar, text="Stop Scan", command=self._stop_scan, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
         self.pause_btn = tk.Button(toolbar, text="Pause Scan", command=self._toggle_pause, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
         self.pause_btn.pack(side=tk.LEFT, padx=5)
+        self.unlock_btn = tk.Button(toolbar, text="Unlock", command=self._unlock_channel, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
+        self.unlock_btn.pack(side=tk.LEFT, padx=5)
         tk.Button(toolbar, text="Stop Monitor", command=self._stop_monitor, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
         tk.Button(toolbar, text="WPS Scan", command=self._wps_scan, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
         tk.Button(toolbar, text="Refresh Adapters", command=self._refresh_adapters, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
@@ -1923,28 +1984,28 @@ class N2NgApp:
         self.channel_pill.pack(side=tk.RIGHT, padx=10)
 
     def _build_network_tree(self, parent):
-        if self.settings.get("show_manufacturers"):
-            cols = ("pwr", "beacons", "data", "ch", "mb", "enc", "cipher", "auth", "mfg", "essid", "bssid")
-            headings = {
-                "pwr": "PWR", "beacons": "Beacons", "data": "#Data", "ch": "CH",
-                "mb": "MB", "enc": "ENC", "cipher": "CIPHER", "auth": "AUTH",
-                "mfg": "Manufacturer", "essid": "ESSID", "bssid": "BSSID",
-            }
-        else:
-            cols = ("pwr", "beacons", "data", "ch", "mb", "enc", "cipher", "auth", "essid", "bssid")
-            headings = {
-                "pwr": "PWR", "beacons": "Beacons", "data": "#Data", "ch": "CH",
-                "mb": "MB", "enc": "ENC", "cipher": "CIPHER", "auth": "AUTH",
-                "essid": "ESSID", "bssid": "BSSID",
-            }
+        cols = tuple(col[0] for col in self.NETWORK_COLUMNS)
+        self._col_headings = {col[0]: col[1] for col in self.NETWORK_COLUMNS}
+
         self.tree = ttk.Treeview(parent, columns=cols, show="headings", selectmode="browse")
-        for c in cols:
-            self.tree.heading(c, text=headings[c])
-            self.tree.column(c, width=80, anchor=tk.CENTER)
-        self.tree.column("essid", width=150)
-        self.tree.column("bssid", width=130)
-        if self.settings.get("show_manufacturers"):
-            self.tree.column("mfg", width=120)
+        for col, heading, width, sort_type, _ in self.NETWORK_COLUMNS:
+            self.tree.heading(
+                col,
+                text=heading,
+                command=lambda c=col: self._on_header_click(c),
+            )
+            self.tree.column(col, width=width, anchor=tk.CENTER)
+
+        # Restore visibility preferences (BSSID stays visible).
+        saved_visibility = self.settings.get("col_visibility")
+        defaults = self.settings.DEFAULTS["col_visibility"]
+        self._col_visibility_vars = {}
+        for col, *_ in self.NETWORK_COLUMNS:
+            if col == "bssid":
+                continue
+            var = tk.BooleanVar(value=saved_visibility.get(col, defaults.get(col, True)))
+            self._col_visibility_vars[col] = var
+        self._apply_col_visibility()
 
         vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.tree.yview)
         hsb = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=self.tree.xview)
@@ -1956,7 +2017,8 @@ class N2NgApp:
         parent.grid_columnconfigure(0, weight=1)
 
         self.tree.bind("<Double-1>", self._on_network_double_click)
-        self.tree.bind("<Button-3>", self._on_network_right_click)
+        self.tree.bind("<Button-3>", self._on_tree_button_three)
+        self.tree.bind("<<TreeviewSelect>>", self._on_network_select)
 
     def _build_right_panel(self, parent):
         self.target_card = tk.LabelFrame(parent, text="Target", bg=THEME["panel"], fg=THEME["fg"])
@@ -2026,10 +2088,9 @@ class N2NgApp:
         self.fix_btn = tk.Button(action_bar, text="Fix Capture", command=self._fix_selected_capture, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
         self.merge_btn = tk.Button(action_bar, text="Merge", command=self._merge_selected, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
         self.hashcat_btn = tk.Button(action_bar, text="Hashcat", command=self._open_hashcat_for_selection, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
-        self.more_btn = tk.Button(action_bar, text="More", command=self._show_history_actions_menu, bg=THEME["panel"], fg=THEME["fg"])
-        for button in (self.inspect_btn, self.convert_btn, self.fix_btn, self.merge_btn, self.hashcat_btn, self.more_btn):
+        self.reload_btn = tk.Button(action_bar, text="Reload", command=self._refresh_history, bg=THEME["panel"], fg=THEME["fg"])
+        for button in (self.inspect_btn, self.convert_btn, self.fix_btn, self.merge_btn, self.hashcat_btn, self.reload_btn):
             button.pack(side=tk.LEFT, padx=2)
-        tk.Button(action_bar, text="Refresh", command=self._refresh_history, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.RIGHT, padx=2)
 
         self.history_empty_var = tk.StringVar(value="Tip: Select a file to reveal available actions. Right-click is also supported.")
         tk.Label(hist_frame, textvariable=self.history_empty_var, bg=THEME["panel"], fg=THEME["warn"], justify=tk.LEFT, wraplength=560).pack(anchor=tk.W, padx=5, pady=(2, 2))
@@ -2158,12 +2219,20 @@ class N2NgApp:
         self._networks_prev.clear()
         self.clients = []
         self.locked_target = None
+        self._selected_bssid = None
+        self.channel_locked = False
+        self.locked_channel = None
+        self._channel_lock_lost_at = None
+        if self._channel_lock_timer_id is not None:
+            self.root.after_cancel(self._channel_lock_timer_id)
+            self._channel_lock_timer_id = None
         self.tree.delete(*self.tree.get_children())
         self.client_tree.delete(*self.client_tree.get_children())
         self.target_label.config(text="No target locked")
         self.size_label.config(text="Capture: 0 B")
         self.channel_pill.config(text="SCANNING ALL", bg="red")
         self.pause_btn.config(text="Pause Scan", state=tk.DISABLED)
+        self.unlock_btn.config(state=tk.DISABLED)
         self.status.config(text="Scan stopped", bg=THEME["panel"], fg=THEME["fg"])
 
     def _wps_scan(self):
@@ -2240,15 +2309,87 @@ class N2NgApp:
         return True, None
 
     def _rebuild_tree_if_needed(self):
-        # Determine if manufacturer column state changed
-        has_mfg = self.settings.get("show_manufacturers")
-        current_cols = self.tree["columns"]
-        has_mfg_col = "mfg" in current_cols
-        if has_mfg != has_mfg_col:
-            # Rebuild treeview
-            parent = self.tree.master
-            self.tree.destroy()
-            self._build_network_tree(parent)
+        # Sync the MANU column visibility with the "show manufacturers" setting.
+        show_mfg = self.settings.get("show_manufacturers")
+        var = self._col_visibility_vars.get("mfg")
+        if var is not None and var.get() != show_mfg:
+            var.set(show_mfg)
+            self._apply_col_visibility()
+
+    # ------------------------------------------------------------------
+    # Network tree column visibility / sorting
+    # ------------------------------------------------------------------
+    def _apply_col_visibility(self):
+        """Show only the columns marked visible; BSSID is always shown."""
+        visible = []
+        for col, *_ in self.NETWORK_COLUMNS:
+            if col == "bssid":
+                visible.append(col)
+                continue
+            var = self._col_visibility_vars.get(col)
+            if var is not None and var.get():
+                visible.append(col)
+        self.tree["displaycolumns"] = tuple(visible)
+
+    def _show_column_menu(self, event):
+        """Right-click on a column header shows the hide/show menu."""
+        if self.tree.identify_region(event.y) != "heading":
+            return
+        menu = tk.Menu(self.root, tearoff=0, bg=THEME["panel"], fg=THEME["fg"])
+        for col, heading, *_ in self.NETWORK_COLUMNS:
+            if col == "bssid":
+                continue
+            var = self._col_visibility_vars[col]
+            menu.add_checkbutton(
+                label=heading,
+                variable=var,
+                command=lambda c=col: self._toggle_column(c),
+            )
+        menu.add_separator()
+        menu.add_command(label="Reset columns", command=self._reset_column_visibility)
+        self._post_context_menu(menu, event.x_root, event.y_root)
+
+    def _toggle_column(self, col: str):
+        """Toggle a single column's visibility and persist it."""
+        self._apply_col_visibility()
+        visibility = {c: var.get() for c, var in self._col_visibility_vars.items()}
+        self.settings.set("col_visibility", visibility)
+        self.settings.save()
+
+    def _reset_column_visibility(self):
+        """Restore default column visibility."""
+        defaults = self.settings.DEFAULTS["col_visibility"]
+        for col, var in self._col_visibility_vars.items():
+            var.set(defaults.get(col, True))
+        self._apply_col_visibility()
+        self.settings.set("col_visibility", dict(defaults))
+        self.settings.save()
+
+    def _on_header_click(self, col: str):
+        """Column header click toggles sort by that column."""
+        if col == "bssid":
+            return
+        sort_type = {c[0]: c[3] for c in self.NETWORK_COLUMNS}.get(col, "alpha")
+        if self._sort_col == col:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_col = col
+            # Numeric columns default to descending; alpha to ascending.
+            self._sort_reverse = sort_type in ("numeric", "numeric_or_string")
+        self._manual_sort_active = True
+        self._update_header_indicators()
+        self._refresh_tree(force_sort=True)
+
+    def _update_header_indicators(self):
+        """Add ▲ / ▼ arrows to the sorted column header."""
+        for col, heading, *_ in self.NETWORK_COLUMNS:
+            if col == "bssid":
+                continue
+            if self._sort_col == col:
+                arrow = "▼" if self._sort_reverse else "▲"
+                self.tree.heading(col, text=f"{heading} {arrow}")
+            else:
+                self.tree.heading(col, text=heading)
 
     def _toggle_pause(self):
         if not self.worker._proc:
@@ -2279,6 +2420,8 @@ class N2NgApp:
         if self.capture_manager and (self.capture_manager.handshake_found or self.capture_manager.pmkid_found):
             self._log("Handshake/PMKID captured, stopping auto-deauth")
             self.auto_deauth_var.set(False)
+            if self.settings.get("auto_unlock_after_capture"):
+                self._unlock_channel()
             return
         bssid = self.locked_target["bssid"]
         self.attack.deauth_all(bssid, self.mon_iface, count=5)
@@ -2286,11 +2429,112 @@ class N2NgApp:
         self.root.after(interval, self._auto_deauth_tick)
 
     def _on_network_double_click(self, event):
+        if self.tree.identify_region(event.y) != "cell":
+            return
         item = self.tree.selection()
         if not item:
             return
         bssid = self.tree.item(item[0], "values")[-1]
         self._lock_target(bssid)
+
+    def _on_tree_button_three(self, event):
+        region = self.tree.identify_region(event.y)
+        if region == "heading":
+            self._show_column_menu(event)
+        elif region == "cell":
+            self._on_network_right_click(event)
+
+    def _on_network_select(self, _event=None):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        bssid = self.tree.item(selected[0], "values")[-1]
+        self._select_target(bssid)
+
+    def _select_target(self, bssid: str):
+        if self._selected_bssid == bssid:
+            return
+        net = self.networks.get(bssid)
+        if not net:
+            return
+        self._selected_bssid = bssid
+        self.locked_target = net
+        ch = net.get("channel", "")
+        if ch:
+            self._lock_channel(int(ch))
+        self._update_target_card(net)
+        self._update_clients(self.clients)
+        self._log(f"Selected target {net['essid']} ({bssid})")
+
+    def _lock_channel(self, ch: int):
+        """Stop channel hopping and lock the adapter to a single channel."""
+        if not self.mon_iface:
+            messagebox.showwarning("N2-ng", "Start monitor mode first.")
+            return
+        if self.channel_locked and self.locked_channel == ch and self.worker.is_running():
+            return
+        if not self.locked_target:
+            return
+        bssid = self.locked_target["bssid"]
+        self.channel_locked = True
+        self.locked_channel = ch
+        self._channel_lock_lost_at = None
+
+        # Best-effort channel set via iw; airodump-ng lock below is authoritative.
+        subprocess.run(["iw", "dev", self.mon_iface, "set", "channel", str(ch)], capture_output=True)
+
+        # Restart airodump-ng in lock mode. This is what actually stops hopping.
+        ok, error = self.worker.start_lock(self.mon_iface, ch, bssid, scan_prefix())
+        if not ok:
+            self.channel_locked = False
+            self.locked_channel = None
+            self.status.config(text=f"Channel lock failed: {error}", bg="red", fg="white")
+            return
+
+        self.pause_btn.config(text="Pause Scan", state=tk.NORMAL)
+        self.unlock_btn.config(state=tk.NORMAL)
+        self.channel_pill.config(text=f"🔒 Locked to CH {ch}", bg="green")
+        self.status.config(text=f"🔒 Locked to CH {ch}", bg=THEME["panel"], fg=THEME["fg"])
+        self._log(f"Locked channel {ch} for {self.locked_target['essid']} ({bssid})")
+
+    def _unlock_channel(self):
+        """Resume channel hopping."""
+        if not self.channel_locked and not self.locked_target:
+            return
+        self.channel_locked = False
+        self.locked_channel = None
+        self._channel_lock_lost_at = None
+        self.locked_target = None
+        self._selected_bssid = None
+        if self._channel_lock_timer_id is not None:
+            self.root.after_cancel(self._channel_lock_timer_id)
+            self._channel_lock_timer_id = None
+        if self.mon_iface:
+            self.worker.start_scan(self.mon_iface, self.current_band.get(), scan_prefix())
+        self.unlock_btn.config(state=tk.DISABLED)
+        self.pause_btn.config(text="Pause Scan", state=tk.NORMAL)
+        self.channel_pill.config(text="SCANNING ALL", bg="red")
+        self.target_label.config(text="No target locked")
+        self.size_label.config(text="Capture: 0 B")
+        self.client_tree.delete(*self.client_tree.get_children())
+        self.status.config(text="🔓 Scanning all channels", bg=THEME["panel"], fg=THEME["fg"])
+        self._log("Channel lock released; scanning all channels")
+
+    def _check_channel_lock(self):
+        """Auto-unlock if the locked target has been missing for 30 seconds."""
+        if not self.channel_locked or not self.locked_target:
+            return
+        bssid = self.locked_target["bssid"]
+        if bssid in self.networks:
+            self._channel_lock_lost_at = None
+            return
+        now = time.time()
+        if self._channel_lock_lost_at is None:
+            self._channel_lock_lost_at = now
+        elif now - self._channel_lock_lost_at > 30:
+            self._unlock_channel()
+            self._log("Locked target disappeared; channel lock auto-released")
+            messagebox.showwarning("N2-ng", "Locked target disappeared. Channel lock released.")
 
     def _on_network_right_click(self, event):
         item = self.tree.identify_row(event.y)
@@ -2369,24 +2613,19 @@ class N2NgApp:
         self._refresh_history()
 
     def _unlock_target(self):
-        self.locked_target = None
-        self.channel_pill.config(text="SCANNING ALL", bg="red")
-        self.target_label.config(text="No target locked")
-        self.size_label.config(text="Capture: 0 B")
-        self.client_tree.delete(*self.client_tree.get_children())
-        self.worker.stop()
-        if self.mon_iface:
-            self.worker.start_scan(self.mon_iface, self.current_band.get(), scan_prefix())
-            self.pause_btn.config(text="Pause Scan", state=tk.NORMAL)
+        self._unlock_channel()
 
     def _update_target_card(self, net: dict):
-        lines = [
+        lines = []
+        if self.channel_locked and self.locked_target and self.locked_target["bssid"] == net["bssid"]:
+            lines.append(f"🔒 Locked to CH {self.locked_channel}")
+        lines.extend([
             f"ESSID: {net.get('essid', '[Hidden]')}",
             f"BSSID: {net['bssid']}",
             f"Channel: {net.get('channel', '')}",
             f"Power: {net.get('power', '')} dBm",
             f"Privacy: {net.get('privacy', '')} / {net.get('cipher', '')} / {net.get('auth', '')}",
-        ]
+        ])
         self.target_label.config(text="\n".join(lines))
 
     def _start_capture_size_monitor(self):
@@ -2503,6 +2742,7 @@ class N2NgApp:
             networks, clients = self.worker.get_latest()
             self._update_networks(networks)
             self._update_clients(clients)
+            self._check_channel_lock()
 
         # Drain asynchronous events.
         while not self.queue.empty():
@@ -2578,16 +2818,26 @@ class N2NgApp:
     def _can_merge_captures(self, caps: list[Path]) -> bool:
         return len(caps) >= 2 and all(is_supported_capture(cap) for cap in caps)
 
+    def _find_related_22000(self, cap: Path) -> Path | None:
+        """Look for a generated .22000 next to the cap or in organized hashcat folders."""
+        sidecar = cap.with_suffix(".22000")
+        if sidecar.exists() and hashcat_22000_info(sidecar)["valid"]:
+            return sidecar
+        candidates = [
+            p for p in capture_root().rglob(f"{cap.stem}.22000")
+            if hashcat_22000_info(p)["valid"]
+        ]
+        if candidates:
+            return max(candidates, key=lambda p: p.stat().st_mtime)
+        return None
+
     def _selected_hash_path(self) -> Path | None:
         primary = self._primary_history_path()
         if not primary:
             return None
         if is_hashcat_22000_file(primary):
             return primary if hashcat_22000_info(primary)["valid"] else None
-        related = primary.with_suffix(".22000")
-        if related.exists() and hashcat_22000_info(related)["valid"]:
-            return related
-        return None
+        return self._find_related_22000(primary)
 
     def _history_details_text(self, path: Path | None) -> str:
         if not path:
@@ -2611,8 +2861,8 @@ class N2NgApp:
             else:
                 lines.append("Hash status: No valid PMKID/EAPOL records found")
         elif is_supported_capture(path):
-            related = path.with_suffix(".22000")
-            if related.exists():
+            related = self._find_related_22000(path)
+            if related:
                 info = hashcat_22000_info(related)
                 lines.append(f"Related .22000: {related}")
                 lines.append(f"Related records: {info['records']}")
@@ -2678,12 +2928,6 @@ class N2NgApp:
         menu.add_command(label="Copy path", state=inspect_state, command=self._copy_selected_path)
         menu.add_command(label="Merge selected", state=merge_state, command=self._merge_selected)
         return menu
-
-    def _show_history_actions_menu(self):
-        menu = self._build_history_actions_menu()
-        x = self.history_actions_btn.winfo_rootx()
-        y = self.history_actions_btn.winfo_rooty() + self.history_actions_btn.winfo_height()
-        self._post_context_menu(menu, x, y)
 
     def _on_history_right_click(self, event):
         item = self.history_tree.identify_row(event.y)
@@ -2932,43 +3176,52 @@ class N2NgApp:
         return result
 
     def _sort_networks(self, networks: list[dict]) -> list[dict]:
-        sort_key = self.settings.get("sort_by")
-        key_map = {
-            "PWR": "power",
-            "Beacons": "beacons",
-            "#Data": "iv",
-            "CH": "channel",
-            "ESSID": "essid",
-            "BSSID": "bssid",
-        }
-        col = key_map.get(sort_key, "power")
-        reverse = True
-        if col in ("essid", "bssid"):
-            reverse = False
+        key_to_col = {c[4]: c[0] for c in self.NETWORK_COLUMNS}
+        if self._sort_col is None:
+            # Fall back to the legacy settings-based default sort.
+            sort_key = self.settings.get("sort_by")
+            key_map = {
+                "PWR": "power",
+                "Beacons": "beacons",
+                "#Data": "iv",
+                "CH": "channel",
+                "ESSID": "essid",
+                "BSSID": "bssid",
+            }
+            data_key = key_map.get(sort_key, "power")
+            col = key_to_col.get(data_key, data_key)
+            sort_type = {c[0]: c[3] for c in self.NETWORK_COLUMNS}.get(col, "alpha")
+            reverse = sort_type in ("numeric", "numeric_or_string")
+        else:
+            col = self._sort_col
+            reverse = self._sort_reverse
+
+        data_key = {c[0]: c[4] for c in self.NETWORK_COLUMNS}.get(col, col)
+        sort_type = {c[0]: c[3] for c in self.NETWORK_COLUMNS}.get(col, "alpha")
 
         def sort_val(net):
-            raw = net.get(col, "")
-            if col in ("power", "beacons", "iv", "channel"):
+            raw = net.get(data_key, "")
+            if sort_type in ("numeric", "numeric_or_string"):
                 try:
                     return int(raw)
                 except (TypeError, ValueError):
+                    if sort_type == "numeric_or_string":
+                        return (1, str(raw).lower())
                     return -9999
+            if sort_type == "alpha":
+                text = str(raw).lower()
+                # Empty ESSIDs sort to the end in ascending order.
+                return (text == "", text) if col == "essid" else text
             return str(raw).lower()
 
         return sorted(networks, key=sort_val, reverse=reverse)
 
     def _network_values(self, net: dict) -> tuple:
-        if self.settings.get("show_manufacturers"):
-            return (
-                net.get("power", ""), net.get("beacons", ""), net.get("iv", ""),
-                net.get("channel", ""), net.get("speed", ""), net.get("privacy", ""),
-                net.get("cipher", ""), net.get("auth", ""), net.get("manufacturer", ""),
-                net.get("essid", ""), net["bssid"],
-            )
         return (
             net.get("power", ""), net.get("beacons", ""), net.get("iv", ""),
             net.get("channel", ""), net.get("speed", ""), net.get("privacy", ""),
-            net.get("cipher", ""), net.get("auth", ""), net.get("essid", ""), net["bssid"],
+            net.get("cipher", ""), net.get("auth", ""), net.get("manufacturer", ""),
+            net.get("essid", ""), net["bssid"],
         )
 
     def _refresh_tree(self, flash_bssids: set[str] | None = None, force_sort: bool = False):
@@ -2976,7 +3229,7 @@ class N2NgApp:
         selected = set(self.tree.selection())
         networks = list(self.networks.values())
         networks = self._filter_networks(networks)
-        if force_sort or self.settings.get("realtime_sort"):
+        if force_sort or self._manual_sort_active or self.settings.get("realtime_sort"):
             networks = self._sort_networks(networks)
         else:
             by_bssid = {net["bssid"]: net for net in networks}
@@ -3001,8 +3254,11 @@ class N2NgApp:
                 self.tree.insert("", tk.END, iid=bssid, values=values, tags=tags)
             self.tree.move(bssid, "", len(self.tree.get_children()))
 
-        # Restore selection if item still exists.
-        for bssid in selected:
+        # Restore selection if item still exists (fall back to tracked BSSID).
+        to_restore = selected
+        if self._selected_bssid and self._selected_bssid not in to_restore:
+            to_restore = to_restore | {self._selected_bssid}
+        for bssid in to_restore:
             if self.tree.exists(bssid):
                 self.tree.selection_add(bssid)
 

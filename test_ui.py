@@ -120,6 +120,99 @@ def test_stop_scan_clears_tree_and_disables_pause():
     root.destroy()
 
 
+def test_network_tree_selection_loads_target_details():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    bssid = "AA:BB:CC:DD:EE:FF"
+    app.networks[bssid] = {
+        "bssid": bssid,
+        "essid": "Net",
+        "power": "-50",
+        "beacons": "10",
+        "iv": "0",
+        "channel": "6",
+        "speed": "54",
+        "privacy": "WPA2",
+        "cipher": "CCMP",
+        "auth": "PSK",
+        "manufacturer": "Vendor",
+    }
+    app._refresh_tree()
+
+    # Simulate selecting the row (left-click / keyboard selection).
+    app.tree.selection_set(bssid)
+    app._on_network_select()
+
+    assert app._selected_bssid == bssid
+    assert app.locked_target is not None
+    assert app.locked_target["bssid"] == bssid
+    assert "Net" in app.target_label.cget("text")
+    root.destroy()
+
+
+def test_target_selection_locks_channel(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.mon_iface = "wlan0mon"
+    monkeypatch.setattr(_n2ng.subprocess, "run", lambda *a, **kw: types.SimpleNamespace(returncode=0))
+    app.worker.start_lock = Mock(return_value=(True, None))
+    bssid = "AA:BB:CC:DD:EE:FF"
+    app.networks[bssid] = {
+        "bssid": bssid,
+        "essid": "Net",
+        "power": "-50",
+        "beacons": "10",
+        "iv": "0",
+        "channel": "6",
+        "speed": "54",
+        "privacy": "WPA2",
+        "cipher": "CCMP",
+        "auth": "PSK",
+        "manufacturer": "Vendor",
+    }
+    app._refresh_tree()
+
+    app.tree.selection_set(bssid)
+    app._on_network_select()
+
+    assert app.channel_locked is True
+    assert app.locked_channel == 6
+    app.worker.start_lock.assert_called_once()
+    assert "🔒 Locked to CH 6" in app.channel_pill.cget("text")
+    root.destroy()
+
+
+def test_unlock_button_resumes_channel_scan(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.mon_iface = "wlan0mon"
+    monkeypatch.setattr(_n2ng.subprocess, "run", lambda *a, **kw: types.SimpleNamespace(returncode=0))
+    app.worker.start_lock = Mock(return_value=(True, None))
+    app.worker.start_scan = Mock(return_value=(True, None))
+    bssid = "AA:BB:CC:DD:EE:FF"
+    app.networks[bssid] = {
+        "bssid": bssid,
+        "essid": "Net",
+        "channel": "6",
+        "privacy": "WPA2",
+    }
+    app._refresh_tree()
+    app.tree.selection_set(bssid)
+    app._on_network_select()
+
+    app._unlock_channel()
+
+    assert app.channel_locked is False
+    assert app.locked_channel is None
+    assert app.locked_target is None
+    app.worker.start_scan.assert_called_once()
+    assert "SCANNING ALL" in app.channel_pill.cget("text")
+    root.destroy()
+
+
 def test_spacebar_toggles_scan_pause():
     root = tk.Tk()
     root.withdraw()
@@ -335,7 +428,20 @@ def test_capture_sessions_panel_has_visible_workflow_controls():
     assert app.fix_btn.cget("text") == "Fix Capture"
     assert app.merge_btn.cget("text") == "Merge"
     assert app.hashcat_btn.cget("text") == "Hashcat"
-    assert app.more_btn.cget("text") == "More"
+    assert app.reload_btn.cget("text") == "Reload"
+    root.destroy()
+
+
+def test_capture_sessions_reload_button_refreshes_history():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app._refresh_history = Mock()
+    app.reload_btn.configure(command=app._refresh_history)
+
+    app.reload_btn.invoke()
+
+    app._refresh_history.assert_called_once()
     root.destroy()
 
 

@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -116,12 +117,12 @@ def test_manufacturer_setting_uses_supported_airodump_flag(monkeypatch):
 def test_capture_fix_uses_pcapfix_outfile_flag(monkeypatch, tmp_path):
     calls = []
     cap = tmp_path / "capture.cap"
-    out = tmp_path / "capture.fixed.cap"
     cap.write_bytes(b"pcap")
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
-        out.write_bytes(b"fixed")
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"fixed")
         return types.SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(_n2ng.shutil, "which", lambda cmd: "/usr/bin/pcapfix" if cmd == "pcapfix" else None)
@@ -131,13 +132,16 @@ def test_capture_fix_uses_pcapfix_outfile_flag(monkeypatch, tmp_path):
     result = manager.fix(cap)
 
     assert result.ok is True
-    assert result.output == out
-    assert calls == [["/usr/bin/pcapfix", "-k", "-o", str(out), str(cap)]]
+    assert result.output.name == "capture.fixed.cap"
+    assert "fixed" in str(result.output)
+    assert result.output.exists()
+    assert calls == [["/usr/bin/pcapfix", "-k", "-o", str(result.output), str(cap)]]
 
 
 def test_capture_fix_reports_no_output_even_when_pcapfix_returns_zero(monkeypatch, tmp_path):
     cap = tmp_path / "capture.cap"
     cap.write_bytes(b"pcap")
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
 
     def fake_run(cmd, **kwargs):
         return types.SimpleNamespace(returncode=0, stdout="Nothing to fix!", stderr="")
@@ -199,6 +203,7 @@ def test_capture_to_22000_uses_hcxpcapngtool_and_validates_records(monkeypatch, 
     calls = []
     cap = tmp_path / "capture with space.cap"
     cap.write_bytes(b"pcap")
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
@@ -212,7 +217,9 @@ def test_capture_to_22000_uses_hcxpcapngtool_and_validates_records(monkeypatch, 
     result = manager.convert_to_22000(cap)
 
     assert result.ok is True
-    assert result.output == tmp_path / "capture with space.22000"
+    assert result.output.name == "capture with space.22000"
+    assert "hashcat" in str(result.output)
+    assert result.output.exists()
     assert result.record_count == 1
     assert calls == [["/usr/bin/hcxpcapngtool", "-o", str(result.output), str(cap)]]
 
@@ -220,6 +227,7 @@ def test_capture_to_22000_uses_hcxpcapngtool_and_validates_records(monkeypatch, 
 def test_capture_to_22000_reports_no_hashes(monkeypatch, tmp_path):
     cap = tmp_path / "capture.cap"
     cap.write_bytes(b"pcap")
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
 
     def fake_run(cmd, **kwargs):
         Path(cmd[cmd.index("-o") + 1]).write_text("")
@@ -239,6 +247,7 @@ def test_capture_to_pcapng_uses_editcap(monkeypatch, tmp_path):
     calls = []
     cap = tmp_path / "capture.cap"
     cap.write_bytes(b"pcap")
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
@@ -252,7 +261,9 @@ def test_capture_to_pcapng_uses_editcap(monkeypatch, tmp_path):
     result = manager.convert_to_pcapng(cap)
 
     assert result.ok is True
-    assert result.output == tmp_path / "capture.pcapng"
+    assert result.output.name == "capture.pcapng"
+    assert "pcapng" in str(result.output)
+    assert result.output.exists()
     assert calls == [["/usr/bin/editcap", "-F", "pcapng", str(cap), str(result.output)]]
 
 
@@ -260,6 +271,7 @@ def test_reconstruct_cap_from_hash_uses_hcxhash2cap(monkeypatch, tmp_path):
     calls = []
     hash_file = tmp_path / "capture.22000"
     hash_file.write_text("WPA*01*abc\n")
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
@@ -273,7 +285,9 @@ def test_reconstruct_cap_from_hash_uses_hcxhash2cap(monkeypatch, tmp_path):
     result = manager.reconstruct_cap_from_hash(hash_file)
 
     assert result.ok is True
-    assert result.output == tmp_path / "capture.reconstructed.cap"
+    assert result.output.name == "capture.reconstructed.cap"
+    assert "reconstructed" in str(result.output)
+    assert result.output.exists()
     assert calls == [["/usr/bin/hcxhash2cap", f"--pmkid-eapol={hash_file}", "-c", str(result.output)]]
 
 
@@ -394,3 +408,40 @@ Station MAC, First time seen, Last time seen, Power, # packets, BSSID, Probed ES
     assert networks[0]["essid"] == "MyWiFi"
     assert len(clients) == 1
     assert clients[0]["station"] == "11:22:33:44:55:66"
+
+
+def test_list_physical_interfaces_falls_back_to_ip_link_and_includes_monitor_iface(monkeypatch):
+    """When airmon-ng fails, existing monitor interfaces must still appear."""
+    airmon = _n2ng.AirmonManager()
+
+    def fake_check_output(cmd, **kwargs):
+        if cmd[0] == "airmon-ng":
+            raise subprocess.CalledProcessError(1, "airmon-ng")
+        if cmd[0] == "ip" and cmd[1] == "link":
+            return "1: lo: <LOOPBACK>\n9: wlan0mon: <BROADCAST,MULTICAST,UP>\n"
+        raise RuntimeError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(_n2ng.subprocess, "check_output", fake_check_output)
+    assert airmon.list_physical_interfaces() == ["wlan0mon"]
+
+
+def test_start_monitor_uses_iface_directly_when_already_monitor_mode(monkeypatch):
+    """Selecting an existing monitor interface should not try to recreate it."""
+    airmon = _n2ng.AirmonManager()
+    run_calls = []
+
+    def fake_check_output(cmd, **kwargs):
+        if cmd[0] == "iw" and cmd[1] == "dev" and cmd[2] == "wlan0mon":
+            return "\tInterface wlan0mon\n\t\ttype monitor\n"
+        raise RuntimeError(f"unexpected command: {cmd}")
+
+    def fake_run(cmd, **kwargs):
+        run_calls.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_n2ng.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(_n2ng.subprocess, "run", fake_run)
+
+    assert airmon.start_monitor("wlan0mon") == "wlan0mon"
+    assert not any(cmd[0] == "airmon-ng" for cmd in run_calls)
+    assert airmon._mon_map.get("wlan0mon") == "wlan0mon"
