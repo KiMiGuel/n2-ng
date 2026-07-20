@@ -4,7 +4,9 @@ import copy
 import csv
 import io
 import json
+import argparse
 import os
+import platform
 import queue
 import re
 import shutil
@@ -22,6 +24,11 @@ import tkinter as tk
 import tkinter.font as tk_font
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+try:
+    from . import __version__
+except ImportError:
+    __version__ = "0.1.0"
+
 
 THEME = {
     "bg": "#000000",
@@ -37,6 +44,20 @@ THEME = {
 VALID_CAPTURE_SUFFIXES = {".cap", ".pcap", ".pcapng"}
 VALID_HISTORY_SUFFIXES = VALID_CAPTURE_SUFFIXES | {".22000"}
 HASHCAT_22000_PREFIXES = ("WPA*01*", "WPA*02*")
+
+
+def demo_csv_path() -> Path | None:
+    """Return the bundled sample airodump CSV used by --demo, if available."""
+    candidates = [
+        # Source-tree location (main.py is at .../src/n2ng/main.py).
+        Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "sample_airodump.csv",
+        # User install location when running through the launcher/alias.
+        Path.home() / "n2-ng" / "tests" / "fixtures" / "sample_airodump.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 @dataclass(frozen=True)
@@ -146,13 +167,13 @@ class AnsiParser:
             parts.append("bold")
         return "ansi_" + "_".join(parts) if parts else "ansi_default"
 
-    def configure_tags(self, text_widget: tk.Text):
+    def configure_tags(self, text_widget: tk.Text, bold_font=None):
         """Create tk.Text tags for all supported ANSI combinations."""
         for fg_code, color in self.FG_COLORS.items():
             text_widget.tag_configure(f"ansi_fg_{fg_code}", foreground=color)
         for bg_code, color in self.BG_COLORS.items():
             text_widget.tag_configure(f"ansi_bg_{bg_code}", background=color)
-        text_widget.tag_configure("ansi_bold", font=("Courier", 10, "bold"))
+        text_widget.tag_configure("ansi_bold", font=bold_font or ("Courier", 10, "bold"))
 
 
 def format_bssid(bssid: str) -> str:
@@ -361,6 +382,9 @@ class DependencyChecker:
         "iw": {"cmd": "iw", "apt": "sudo apt install -y iw"},
         "ip": {"cmd": "ip", "apt": "sudo apt install -y iproute2"},
     }
+    # These tools are not meaningful (or not available) on macOS and should
+    # never prevent the GUI from launching.
+    LINUX_ONLY_TOOLS = {"iw", "airmon-ng", "reaver"}
     OPTIONAL_TOOLS = {
         "hcxpcapngtool": {"cmd": "hcxpcapngtool", "apt": "sudo apt install -y hcxtools", "feature": "Capture to Hashcat 22000 conversion"},
         "hcxhash2cap": {"cmd": "hcxhash2cap", "apt": "sudo apt install -y hcxtools", "feature": "Reconstructed CAP from 22000 hashes"},
@@ -427,7 +451,22 @@ class DependencyChecker:
         return False, combined.strip().splitlines()[-1] if combined.strip() else f"Exited {rc.returncode}"
 
     @classmethod
+    def _is_linux_only(cls, name: str) -> bool:
+        return name in cls.LINUX_ONLY_TOOLS and platform.system() == "Darwin"
+
+    @classmethod
     def _status_for(cls, name: str, info: dict, required: bool) -> dict:
+        if cls._is_linux_only(name):
+            return {
+                **info,
+                "required": False,
+                "installed": False,
+                "path": None,
+                "feature": info.get("feature", ""),
+                "version": "",
+                "usable": False,
+                "runtime_status": f"Linux-only tool '{name}' — live capture/attack unavailable on this platform, demo mode only.",
+            }
         resolved = cls.resolve_tool(name)
         usable = resolved.installed
         runtime_status = "Installed" if resolved.installed else "Missing"
@@ -461,9 +500,10 @@ class DependencyChecker:
 class DependencySplash(tk.Toplevel):
     """Startup dependency report shown before the main window."""
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, demo_mode: bool = False):
         super().__init__(root)
         self.root = root
+        self.demo_mode = demo_mode
         self.result = True
         self.title("N2-ng loading")
         self.configure(bg=THEME["bg"])
@@ -478,7 +518,7 @@ class DependencySplash(tk.Toplevel):
             fg=THEME["fg"],
             font=("TkDefaultFont", 12, "bold"),
         ).pack(anchor=tk.W, padx=12, pady=(12, 6))
-        self.text = tk.Text(self, bg=THEME["bg"], fg=THEME["fg"], height=20, width=72, state=tk.DISABLED)
+        self.text = tk.Text(self, bg=THEME["bg"], fg=THEME["fg"], height=20, width=72, state=tk.DISABLED, width=10)
         self.text.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
         self.hint = tk.Label(self, text="", bg=THEME["bg"], fg=THEME["warn"])
         self.hint.pack(anchor=tk.W, padx=12, pady=(0, 12))
@@ -495,7 +535,7 @@ class DependencySplash(tk.Toplevel):
         self.text.config(state=tk.NORMAL)
         self.text.insert(tk.END, line + "\n")
         self.text.see(tk.END)
-        self.text.config(state=tk.DISABLED)
+        self.text.config(state=tk.DISABLED, width=10)
         self.update_idletasks()
 
     def _run_checks(self):
@@ -510,18 +550,22 @@ class DependencySplash(tk.Toplevel):
                 runtime = status.get("runtime_status", "Installed")
                 self._append(f"{marker} {name} ({label}){feature} - {runtime}{path}")
             else:
-                self._append(f"[MISSING] {name} ({label}){feature} - install: {status['apt']}")
-                if status["required"]:
-                    missing_required.append(name)
+                runtime = status.get("runtime_status", "")
+                if runtime.startswith("Linux-only"):
+                    self._append(f"[INFO]    {name} ({label}){feature} - {runtime}")
+                else:
+                    self._append(f"[MISSING] {name} ({label}){feature} - install: {status['apt']}")
+                    if status["required"]:
+                        missing_required.append(name)
         self._checks_done = True
-        if missing_required:
-            self.result = False
+        if missing_required and not self.demo_mode:
             self.hint.config(text="Required tools are missing. Click to close after reading.")
             messagebox.showwarning(
                 "N2-ng dependencies",
                 "Missing required tools:\n"
                 + "\n".join(missing_required)
-                + "\n\nInstall commands are shown in the loading screen.",
+                + "\n\nInstall commands are shown in the loading screen."
+                + "\n\nYou may continue, but live capture/attack features will be disabled.",
                 parent=self,
             )
         else:
@@ -672,6 +716,15 @@ def _normalize_csv_reader(reader: csv.DictReader):
     return reader
 
 
+def _csv_field(row: dict, *keys: str) -> str:
+    """Return the first non-empty value for any of the given CSV keys."""
+    for key in keys:
+        value = row.get(key, "")
+        if value:
+            return value.strip()
+    return ""
+
+
 def parse_airodump_csv(text: str):
     networks = []
     clients = []
@@ -699,8 +752,8 @@ def parse_airodump_csv(text: str):
             "cipher": row.get("Cipher", "").strip(),
             "auth": row.get("Authentication", "").strip(),
             "power": row.get("Power", "").strip(),
-            "beacons": (row.get("# Beacons", "") or row.get("#Beacons", "")).strip(),
-            "iv": (row.get("# IV", "") or row.get("#IV", "")).strip(),
+            "beacons": _csv_field(row, "# Beacons", "#Beacons", "# beacons", "#beacons"),
+            "iv": _csv_field(row, "# IV", "#IV", "# iv", "#iv"),
             "id_len": row.get("ID-length", "").strip(),
             "manufacturer": row.get("Manufacturer", "").strip(),
             "essid": essid,
@@ -1410,7 +1463,7 @@ class ConversionDialog(tk.Toplevel):
         self.status.config(state=tk.NORMAL)
         self.status.delete("1.0", tk.END)
         self.status.insert(tk.END, text)
-        self.status.config(state=tk.DISABLED)
+        self.status.config(state=tk.DISABLED, width=10)
 
     def _convert(self):
         if self.mode.get() == "pcapng":
@@ -1463,7 +1516,7 @@ class HashcatDialog(tk.Toplevel):
         buttons = tk.Frame(self, bg=THEME["panel"])
         buttons.pack(fill=tk.X, padx=10, pady=(0, 10))
         self.start_btn = tk.Button(buttons, text="Start", command=self._start, bg=THEME["panel"], fg=THEME["fg"])
-        self.stop_btn = tk.Button(buttons, text="Stop", command=self._stop, bg=THEME["error"], fg="#ffffff", state=tk.DISABLED)
+        self.stop_btn = tk.Button(buttons, text="Stop", command=self._stop, bg=THEME["error"], fg="#ffffff", state=tk.DISABLED, width=10)
         self.start_btn.pack(side=tk.LEFT)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         tk.Button(buttons, text="Close", command=self.destroy, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.RIGHT)
@@ -1506,7 +1559,7 @@ class HashcatDialog(tk.Toplevel):
             self._append(str(exc) + "\n")
             return
         cmd[0] = hashcat.path
-        self.start_btn.config(state=tk.DISABLED)
+        self.start_btn.config(state=tk.DISABLED, width=10)
         self.stop_btn.config(state=tk.NORMAL)
         self.thread = threading.Thread(target=self._run_hashcat, args=(cmd,), daemon=True)
         self.thread.start()
@@ -1576,7 +1629,7 @@ class AirodumpRawView:
 
     MAX_LINES = 500
 
-    def __init__(self, parent):
+    def __init__(self, parent, font=None):
         self.frame = tk.Frame(parent, bg=THEME["bg"])
         self.frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         parent.grid_rowconfigure(0, weight=1)
@@ -1586,7 +1639,7 @@ class AirodumpRawView:
             self.frame,
             bg=THEME["bg"],
             fg=THEME["fg"],
-            font=("Consolas", 10),
+            font=font or ("Consolas", 10),
             wrap=tk.NONE,
             state=tk.DISABLED,
             height=20,
@@ -1667,7 +1720,7 @@ class AirodumpRawView:
         if count > self.MAX_LINES:
             self.text.delete("1.0", f"{count - self.MAX_LINES}.0")
         self.text.see(tk.END)
-        self.text.config(state=tk.DISABLED)
+        self.text.config(state=tk.DISABLED, width=10)
 
 
 class SettingsDialog(tk.Toplevel):
@@ -1788,9 +1841,10 @@ class N2NgApp:
         ("bssid", "BSSID", 130, None, "bssid"),
     )
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, demo_mode: bool = False):
         self.root = root
-        self.root.title("N2-ng")
+        self.demo_mode = demo_mode
+        self.root.title(f"N2-ng v{__version__}")
         self.root.geometry("1320x760")
         self.root.minsize(1000, 600)
         self.root.configure(bg=THEME["bg"])
@@ -1830,12 +1884,24 @@ class N2NgApp:
         self._channel_lock_lost_at: float | None = None
         self._channel_lock_timer_id: str | None = None
 
+        # Responsive font sizing.
+        self._ui_font: tk_font.Font | None = None
+        self._ui_font_bold: tk_font.Font | None = None
+        self._mono_font: tk_font.Font | None = None
+        self._mono_font_bold: tk_font.Font | None = None
+        self._resize_after_id: str | None = None
+        self._history_refresh_id: str | None = None
+
         self._configure_ttk_styles()
         self._build_ui()
         self._refresh_adapters()
         self._poll_queue()
+        self._schedule_history_refresh()
         self.root.bind_all("<Button-1>", self._dismiss_context_menu, add="+")
         self.root.bind_all("<space>", self._on_spacebar_pause, add="+")
+        self._update_feature_availability()
+        if self.demo_mode:
+            self._load_demo_data()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         atexit.register(self._cleanup)
@@ -1849,19 +1915,23 @@ class N2NgApp:
         # Prefer the clam theme because it reliably honors custom colors.
         if "clam" in style.theme_names():
             style.theme_use("clam")
-        if "Consolas" in tk_font.families():
-            self.mono_font = ("Consolas", 10)
-            self.mono_font_bold = ("Consolas", 10, "bold")
-        else:
-            self.mono_font = ("Courier", 10)
-            self.mono_font_bold = ("Courier", 10, "bold")
+        mono_family = "Consolas" if "Consolas" in tk_font.families() else "Courier"
+        self._ui_font = tk_font.Font(family="TkDefaultFont", size=10)
+        self._ui_font_bold = tk_font.Font(family="TkDefaultFont", size=10, weight="bold")
+        self._mono_font = tk_font.Font(family=mono_family, size=10)
+        self._mono_font_bold = tk_font.Font(family=mono_family, size=10, weight="bold")
+        # Legacy tuple attributes kept for internal helpers.
+        self.mono_font = (mono_family, 10)
+        self.mono_font_bold = (mono_family, 10, "bold")
+        # Make the scalable UI font the default for all widgets.
+        self.root.option_add("*Font", self._ui_font)
         style.configure(
             "Treeview",
             background=THEME["bg"],
             foreground=THEME["fg"],
             fieldbackground=THEME["bg"],
             font=self.mono_font,
-            rowheight=18,
+            rowheight=max(18, self._mono_font.metrics("linespace") + 2),
         )
         style.configure(
             "Treeview.Heading",
@@ -1888,6 +1958,54 @@ class N2NgApp:
             bordercolor=THEME["bg"],
             arrowcolor=THEME["fg"],
         )
+        self.root.bind("<Configure>", self._on_resize)
+
+    def _on_resize(self, event):
+        """Debounce resize events and recompute scalable fonts/columns."""
+        if event.widget is not self.root:
+            return
+        if self._resize_after_id is not None:
+            self.root.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.root.after(200, self._apply_responsive_fonts)
+
+    def _apply_responsive_fonts(self):
+        """Scale fonts with window size (8-16 pt) and refresh column widths."""
+        if not self.root.winfo_exists():
+            return
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        size = max(8, min(16, min(width, height) // 60))
+        self._ui_font.config(size=size)
+        self._ui_font_bold.config(size=size)
+        self._mono_font.config(size=size)
+        self._mono_font_bold.config(size=size)
+        self.mono_font = (self._mono_font.cget("family"), size)
+        self.mono_font_bold = (self._mono_font.cget("family"), size, "bold")
+        style = ttk.Style(self.root)
+        style.configure(
+            "Treeview",
+            font=self.mono_font,
+            rowheight=max(14, self._mono_font.metrics("linespace") + 2),
+        )
+        style.configure("Treeview.Heading", font=self.mono_font_bold)
+        self._recalc_column_widths()
+
+    def _recalc_column_widths(self):
+        """Recalculate tree column widths so the MAC is never truncated."""
+        if not self.root.winfo_exists() or not self.tree.winfo_exists():
+            return
+        mac_width = self._mono_font.measure("00:00:00:00:00:00") + 24
+        self.tree.column("bssid", width=mac_width, minwidth=mac_width)
+        # Scale other columns relative to the base 10pt size.
+        base_size = self._mono_font.cget("size")
+        ratio = max(0.8, min(1.6, base_size / 10))
+        for col, heading, width, *_ in self.NETWORK_COLUMNS:
+            if col == "bssid":
+                continue
+            self.tree.column(col, width=int(width * ratio), minwidth=self._mono_font.measure(heading) + 12)
+        if hasattr(self, "history_tree") and self.history_tree.winfo_exists():
+            path_width = self._mono_font.measure("/home/user/hs/n2-ng/hashcat/2026-07-20/capture.22000") + 24
+            self.history_tree.column("path", width=path_width, minwidth=path_width)
 
     def _build_ui(self):
         self._build_toolbar()
@@ -1949,7 +2067,8 @@ class N2NgApp:
 
     def _build_raw_view(self, parent):
         """Build the Raw View tab."""
-        self.raw_view = AirodumpRawView(parent)
+        self.raw_view = AirodumpRawView(parent, font=self._mono_font)
+        self.raw_view.ansi.configure_tags(self.raw_view.text, bold_font=self._mono_font_bold)
 
     def _build_toolbar(self):
         toolbar = tk.Frame(self.root, bg=THEME["panel"])
@@ -1969,18 +2088,21 @@ class N2NgApp:
         )
         self.band_combo.pack(side=tk.LEFT, padx=5)
 
-        tk.Button(toolbar, text="Start Monitor", command=self._start_monitor, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        self.start_monitor_btn = tk.Button(toolbar, text="Start Monitor", command=self._start_monitor, bg=THEME["panel"], fg=THEME["fg"])
+        self.start_monitor_btn.pack(side=tk.LEFT, padx=5)
         tk.Button(toolbar, text="Stop Scan", command=self._stop_scan, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
-        self.pause_btn = tk.Button(toolbar, text="Pause Scan", command=self._toggle_pause, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
+        self.pause_btn = tk.Button(toolbar, text="Pause Scan", command=self._toggle_pause, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED, width=10)
         self.pause_btn.pack(side=tk.LEFT, padx=5)
-        self.unlock_btn = tk.Button(toolbar, text="Unlock", command=self._unlock_channel, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
+        self.unlock_btn = tk.Button(toolbar, text="Unlock", command=self._unlock_channel, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED, width=10)
         self.unlock_btn.pack(side=tk.LEFT, padx=5)
-        tk.Button(toolbar, text="Stop Monitor", command=self._stop_monitor, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
-        tk.Button(toolbar, text="WPS Scan", command=self._wps_scan, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
-        tk.Button(toolbar, text="Refresh Adapters", command=self._refresh_adapters, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
+        self.stop_monitor_btn = tk.Button(toolbar, text="Stop Monitor", command=self._stop_monitor, bg=THEME["panel"], fg=THEME["fg"])
+        self.stop_monitor_btn.pack(side=tk.LEFT, padx=5)
+        self.wps_scan_btn = tk.Button(toolbar, text="WPS Scan", command=self._wps_scan, bg=THEME["panel"], fg=THEME["fg"])
+        self.wps_scan_btn.pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="Refresh Adapters", command=self._refresh_adapters, bg=THEME["panel"], fg=THEME["fg"], font=("TkDefaultFont", 7)).pack(side=tk.LEFT, padx=5)
         tk.Button(toolbar, text="Settings", command=self._open_settings, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
 
-        self.channel_pill = tk.Label(toolbar, text="SCANNING ALL", bg="red", fg="white", font=("TkDefaultFont", 10, "bold"))
+        self.channel_pill = tk.Label(toolbar, text="SCANNING ALL", bg="red", fg="white", font=self._ui_font_bold)
         self.channel_pill.pack(side=tk.RIGHT, padx=10)
 
     def _build_network_tree(self, parent):
@@ -1994,7 +2116,9 @@ class N2NgApp:
                 text=heading,
                 command=lambda c=col: self._on_header_click(c),
             )
-            self.tree.column(col, width=width, anchor=tk.CENTER)
+            # Do not stretch columns to fit the widget width; rely on the
+            # horizontal scrollbar so content like full MACs remains readable.
+            self.tree.column(col, width=width, anchor=tk.CENTER, stretch=False)
 
         # Restore visibility preferences (BSSID stays visible).
         saved_visibility = self.settings.get("col_visibility")
@@ -2019,6 +2143,21 @@ class N2NgApp:
         self.tree.bind("<Double-1>", self._on_network_double_click)
         self.tree.bind("<Button-3>", self._on_tree_button_three)
         self.tree.bind("<<TreeviewSelect>>", self._on_network_select)
+        self.tree.bind("<Shift-MouseWheel>", self._on_tree_horizontal_scroll)
+        self.tree.bind("<Shift-Button-4>", self._on_tree_horizontal_scroll)
+        self.tree.bind("<Shift-Button-5>", self._on_tree_horizontal_scroll)
+        self._recalc_column_widths()
+
+    def _on_tree_horizontal_scroll(self, event):
+        """Shift+mousewheel scrolls the network tree horizontally."""
+        delta = 0
+        if event.num == 4 or getattr(event, "delta", 0) > 0:
+            delta = -1
+        elif event.num == 5 or getattr(event, "delta", 0) < 0:
+            delta = 1
+        if delta:
+            self.tree.xview_scroll(delta, "units")
+        return "break"
 
     def _build_right_panel(self, parent):
         self.target_card = tk.LabelFrame(parent, text="Target", bg=THEME["panel"], fg=THEME["fg"])
@@ -2044,10 +2183,10 @@ class N2NgApp:
         # Attack panel
         self.attack_frame = tk.LabelFrame(parent, text="Attacks", bg=THEME["panel"], fg=THEME["fg"])
         self.attack_frame.pack(fill=tk.X, padx=5, pady=5)
-        tk.Button(self.attack_frame, text="Deauthenticate All Clients", command=self._deauth_all, bg="#333333", fg=THEME["accent"], font=("TkDefaultFont", 11, "bold")).pack(fill=tk.X, padx=5, pady=3)
-        tk.Button(self.attack_frame, text="Deauthenticate Specific Client", command=self._deauth_client, bg="#333333", fg=THEME["accent"], font=("TkDefaultFont", 11, "bold")).pack(fill=tk.X, padx=5, pady=3)
-        tk.Button(self.attack_frame, text="Reaver WPS Attack", command=self._reaver_attack, bg="#333333", fg=THEME["accent"], font=("TkDefaultFont", 11, "bold")).pack(fill=tk.X, padx=5, pady=3)
-        tk.Button(self.attack_frame, text="Stop Attack", command=self._stop_attack, bg=THEME["error"], fg="#ffffff", font=("TkDefaultFont", 11, "bold")).pack(fill=tk.X, padx=5, pady=3)
+        tk.Button(self.attack_frame, text="Deauthenticate All Clients", command=self._deauth_all, bg="#333333", fg=THEME["accent"], font=self._ui_font_bold).pack(fill=tk.X, padx=5, pady=3)
+        tk.Button(self.attack_frame, text="Deauthenticate Specific Client", command=self._deauth_client, bg="#333333", fg=THEME["accent"], font=self._ui_font_bold).pack(fill=tk.X, padx=5, pady=3)
+        tk.Button(self.attack_frame, text="Reaver WPS Attack", command=self._reaver_attack, bg="#333333", fg=THEME["accent"], font=self._ui_font_bold).pack(fill=tk.X, padx=5, pady=3)
+        tk.Button(self.attack_frame, text="Stop Attack", command=self._stop_attack, bg=THEME["error"], fg="#ffffff", font=self._ui_font_bold).pack(fill=tk.X, padx=5, pady=3)
 
         self.legacy_visible = tk.BooleanVar(value=False)
         tk.Checkbutton(self.attack_frame, text="Show Legacy WEP Attacks", variable=self.legacy_visible, command=self._toggle_legacy, bg=THEME["panel"], fg=THEME["fg"], selectcolor=THEME["panel"]).pack(anchor=tk.W, padx=5)
@@ -2083,14 +2222,16 @@ class N2NgApp:
 
         action_bar = tk.Frame(hist_frame, bg=THEME["panel"])
         action_bar.pack(fill=tk.X, padx=4, pady=2)
-        self.inspect_btn = tk.Button(action_bar, text="Inspect", command=self._inspect_selected_capture, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
-        self.convert_btn = tk.Button(action_bar, text="Convert to 22000", command=self._convert_selected_to_22000, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
-        self.fix_btn = tk.Button(action_bar, text="Fix Capture", command=self._fix_selected_capture, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
-        self.merge_btn = tk.Button(action_bar, text="Merge", command=self._merge_selected, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
-        self.hashcat_btn = tk.Button(action_bar, text="Hashcat", command=self._open_hashcat_for_selection, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
-        self.reload_btn = tk.Button(action_bar, text="Reload", command=self._refresh_history, bg=THEME["panel"], fg=THEME["fg"])
-        for button in (self.inspect_btn, self.convert_btn, self.fix_btn, self.merge_btn, self.hashcat_btn, self.reload_btn):
+        self.inspect_btn = tk.Button(action_bar, text="Inspect", command=self._inspect_selected_capture, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED, width=10)
+        self.convert_btn = tk.Button(action_bar, text="Convert to 22000", command=self._convert_selected_to_22000, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED, width=10)
+        self.fix_btn = tk.Button(action_bar, text="Fix Capture", command=self._fix_selected_capture, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED, width=10)
+        self.merge_btn = tk.Button(action_bar, text="Merge", command=self._merge_selected, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED, width=10)
+        self.hashcat_btn = tk.Button(action_bar, text="Hashcat", command=self._open_hashcat_for_selection, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED, width=10)
+        for button in (self.inspect_btn, self.convert_btn, self.fix_btn, self.merge_btn, self.hashcat_btn):
             button.pack(side=tk.LEFT, padx=2)
+
+        # Auto-refresh the capture-sessions history every 20 seconds.
+        self._schedule_history_refresh()
 
         self.history_empty_var = tk.StringVar(value="Tip: Select a file to reveal available actions. Right-click is also supported.")
         tk.Label(hist_frame, textvariable=self.history_empty_var, bg=THEME["panel"], fg=THEME["warn"], justify=tk.LEFT, wraplength=560).pack(anchor=tk.W, padx=5, pady=(2, 2))
@@ -2106,7 +2247,9 @@ class N2NgApp:
             ("path", "Full path", 420),
         ):
             self.history_tree.heading(col, text=heading)
-            self.history_tree.column(col, width=width, stretch=col == "path")
+            # Keep columns at their natural width so the horizontal scrollbar
+            # activates when paths/BSSIDs/ESSIDs are too long to fit.
+            self.history_tree.column(col, width=width, stretch=False)
         self.history_vscroll = ttk.Scrollbar(history_body, orient=tk.VERTICAL, command=self.history_tree.yview)
         self.history_hscroll = ttk.Scrollbar(history_body, orient=tk.HORIZONTAL, command=self.history_tree.xview)
         self.history_tree.configure(yscrollcommand=self.history_vscroll.set, xscrollcommand=self.history_hscroll.set)
@@ -2118,8 +2261,15 @@ class N2NgApp:
         self.history_tree.bind("<Button-3>", self._on_history_right_click)
         self.history_tree.bind("<<TreeviewSelect>>", lambda _event=None: self._update_history_selection())
 
-        self.history_details = tk.Text(hist_frame, height=7, bg=THEME["bg"], fg=THEME["fg"], wrap=tk.NONE, state=tk.DISABLED)
-        self.history_details.pack(fill=tk.X, padx=4, pady=(2, 4))
+        details_frame = tk.Frame(hist_frame, bg=THEME["panel"])
+        details_frame.pack(fill=tk.BOTH, expand=False, padx=4, pady=(2, 4))
+        details_frame.grid_rowconfigure(0, weight=1)
+        details_frame.grid_columnconfigure(0, weight=1)
+        self.history_details = tk.Text(details_frame, height=7, bg=THEME["bg"], fg=THEME["fg"], wrap=tk.NONE, state=tk.DISABLED, width=10)
+        self.history_details_xscroll = ttk.Scrollbar(details_frame, orient=tk.HORIZONTAL, command=self.history_details.xview)
+        self.history_details.config(xscrollcommand=self.history_details_xscroll.set)
+        self.history_details.grid(row=0, column=0, sticky="nsew")
+        self.history_details_xscroll.grid(row=1, column=0, sticky="ew")
 
     def _toggle_legacy(self):
         if self.legacy_visible.get():
@@ -2142,7 +2292,7 @@ class N2NgApp:
         log_frame.grid_propagate(False)
         log_frame.grid_rowconfigure(0, weight=1)
         log_frame.grid_columnconfigure(0, weight=1)
-        self.log_text = tk.Text(log_frame, height=6, bg=THEME["bg"], fg=THEME["fg"], state=tk.DISABLED)
+        self.log_text = tk.Text(log_frame, height=6, bg=THEME["bg"], fg=THEME["fg"], state=tk.DISABLED, width=10)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         sb = tk.Scrollbar(log_frame, command=self.log_text.yview)
         sb.grid(row=0, column=1, sticky="ns")
@@ -2175,6 +2325,59 @@ class N2NgApp:
         else:
             self._log("All dependencies satisfied")
 
+    def _update_feature_availability(self):
+        """Disable buttons whose underlying tools are missing (or demo mode)."""
+        can_monitor = (
+            not self.demo_mode
+            and DependencyChecker.resolve_tool("airmon-ng").installed
+            and DependencyChecker.resolve_tool("airodump-ng").installed
+            and DependencyChecker.resolve_tool("iw").installed
+        )
+        can_attack = (
+            not self.demo_mode
+            and DependencyChecker.resolve_tool("aireplay-ng").installed
+        )
+        can_wps = (
+            not self.demo_mode
+            and (
+                DependencyChecker.resolve_tool("wash").installed
+                or DependencyChecker.resolve_tool("reaver").installed
+            )
+        )
+        monitor_state = tk.NORMAL if can_monitor else tk.DISABLED
+        for widget in (self.adapter_combo, self.band_combo):
+            widget.configure(state="readonly" if can_monitor else "disabled")
+        for button in (self.start_monitor_btn, self.stop_monitor_btn):
+            button.configure(state=monitor_state)
+        self.wps_scan_btn.configure(state=tk.NORMAL if can_wps else tk.DISABLED)
+        # Attack buttons live inside the Attacks frame.
+        for child in self.attack_frame.winfo_children():
+            if isinstance(child, tk.Button):
+                child.configure(state=tk.NORMAL if can_attack else tk.DISABLED)
+        for child in getattr(self, "legacy_frame", self.attack_frame).winfo_children():
+            if isinstance(child, tk.Button):
+                child.configure(state=tk.NORMAL if can_attack else tk.DISABLED)
+
+    def _load_demo_data(self):
+        """Load the bundled sample CSV for UI verification without a wireless adapter."""
+        path = demo_csv_path()
+        if not path:
+            self._log("Demo mode: no sample CSV found")
+            return
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError as exc:
+            self._log(f"Demo mode: could not read {path}: {exc}")
+            return
+        networks, clients = parse_airodump_csv(text)
+        for net in networks:
+            self.networks[net["bssid"]] = net
+        self.clients = clients
+        self._refresh_tree(force_sort=True)
+        self._update_clients(clients)
+        self.status.config(text=f"Demo mode: loaded {len(networks)} network(s) from {path.name}")
+        self._log(f"Demo mode: loaded {len(networks)} network(s) and {len(clients)} client(s)")
+
     def _refresh_adapters(self):
         ifaces = self.airmon.list_physical_interfaces()
         self.adapter_combo["values"] = tuple(ifaces)
@@ -2195,7 +2398,7 @@ class N2NgApp:
                 failed_iface = self.mon_iface
                 self.mon_iface = None
                 self.airmon.stop_monitor(failed_iface)
-                self.pause_btn.config(text="Pause Scan", state=tk.DISABLED)
+                self.pause_btn.config(text="Pause Scan", state=tk.DISABLED, width=10)
                 self.status.config(text=f"Scan failed: {error}", bg="red", fg="white")
                 return
             self.pause_btn.config(text="Pause Scan", state=tk.NORMAL)
@@ -2210,7 +2413,7 @@ class N2NgApp:
             self.mon_iface = None
         self.status.config(text="Monitor stopped")
         self.channel_pill.config(text="SCANNING ALL", bg="red")
-        self.pause_btn.config(text="Pause Scan", state=tk.DISABLED)
+        self.pause_btn.config(text="Pause Scan", state=tk.DISABLED, width=10)
 
     def _stop_scan(self):
         self.worker.stop()
@@ -2231,8 +2434,8 @@ class N2NgApp:
         self.target_label.config(text="No target locked")
         self.size_label.config(text="Capture: 0 B")
         self.channel_pill.config(text="SCANNING ALL", bg="red")
-        self.pause_btn.config(text="Pause Scan", state=tk.DISABLED)
-        self.unlock_btn.config(state=tk.DISABLED)
+        self.pause_btn.config(text="Pause Scan", state=tk.DISABLED, width=10)
+        self.unlock_btn.config(state=tk.DISABLED, width=10)
         self.status.config(text="Scan stopped", bg=THEME["panel"], fg=THEME["fg"])
 
     def _wps_scan(self):
@@ -2245,7 +2448,7 @@ class N2NgApp:
         self.wps_dialog.title("WPS Scan")
         self.wps_dialog.configure(bg=THEME["bg"])
         self.wps_dialog.geometry("700x400")
-        text = tk.Text(self.wps_dialog, bg=THEME["bg"], fg=THEME["fg"], state=tk.DISABLED)
+        text = tk.Text(self.wps_dialog, bg=THEME["bg"], fg=THEME["fg"], state=tk.DISABLED, width=10)
         text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.wps_text = text
         self.wps_scanner = WpsScanner(self.mon_iface, self._on_wps_event)
@@ -2265,7 +2468,7 @@ class N2NgApp:
             self.wps_text.delete("1.0", tk.END)
             self.wps_text.insert(tk.END, "\n".join(self.wps_lines[-200:]))
             self.wps_text.see(tk.END)
-            self.wps_text.config(state=tk.DISABLED)
+            self.wps_text.config(state=tk.DISABLED, width=10)
 
     def _stop_wps_scan(self):
         if hasattr(self, "wps_scanner"):
@@ -2511,7 +2714,7 @@ class N2NgApp:
             self._channel_lock_timer_id = None
         if self.mon_iface:
             self.worker.start_scan(self.mon_iface, self.current_band.get(), scan_prefix())
-        self.unlock_btn.config(state=tk.DISABLED)
+        self.unlock_btn.config(state=tk.DISABLED, width=10)
         self.pause_btn.config(text="Pause Scan", state=tk.NORMAL)
         self.channel_pill.config(text="SCANNING ALL", bg="red")
         self.target_label.config(text="No target locked")
@@ -2601,7 +2804,7 @@ class N2NgApp:
         if not ok:
             self.locked_target = None
             self.status.config(text=f"Target lock failed: {error}", bg="red", fg="white")
-            self.pause_btn.config(text="Pause Scan", state=tk.DISABLED)
+            self.pause_btn.config(text="Pause Scan", state=tk.DISABLED, width=10)
             return
         self.pause_btn.config(text="Pause Scan", state=tk.NORMAL)
         self.capture_manager.set_active_cap(Path(f"{prefix}-01.cap"))
@@ -2808,6 +3011,13 @@ class N2NgApp:
             captures.extend(base.rglob(pattern))
         self._set_history_items(list(set(captures)), select_path)
 
+    def _schedule_history_refresh(self):
+        """Refresh capture-sessions history every 20 seconds."""
+        if not self.root.winfo_exists():
+            return
+        self._refresh_history()
+        self._history_refresh_id = self.root.after(20000, self._schedule_history_refresh)
+
     def _history_selected_paths(self) -> list[Path]:
         return [self._history_paths[item] for item in self.history_tree.selection() if item in self._history_paths]
 
@@ -2877,7 +3087,7 @@ class N2NgApp:
         self.history_details.config(state=tk.NORMAL)
         self.history_details.delete("1.0", tk.END)
         self.history_details.insert(tk.END, text)
-        self.history_details.config(state=tk.DISABLED)
+        self.history_details.config(state=tk.DISABLED, width=10)
 
     def _update_history_selection(self):
         selected = self._history_selected_paths()
@@ -3288,7 +3498,7 @@ class N2NgApp:
             self.log_text.config(state=tk.NORMAL)
             self.log_text.insert(tk.END, f"[{ts}] {msg}\n")
             self.log_text.see(tk.END)
-            self.log_text.config(state=tk.DISABLED)
+            self.log_text.config(state=tk.DISABLED, width=10)
         # Also mirror to stdout for debugging
         print(f"[{ts}] {msg}")
 
@@ -3303,6 +3513,12 @@ class N2NgApp:
         if self.poll_id:
             self.root.after_cancel(self.poll_id)
             self.poll_id = None
+        if self._resize_after_id is not None:
+            self.root.after_cancel(self._resize_after_id)
+            self._resize_after_id = None
+        if self._history_refresh_id is not None:
+            self.root.after_cancel(self._history_refresh_id)
+            self._history_refresh_id = None
         self.worker.shutdown()
         self.airmon.cleanup()
 
@@ -3340,15 +3556,27 @@ def ensure_root():
     sys.exit(proc.returncode)
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(prog="n2-ng", description="Single-window GUI for the aircrack-ng suite")
+    parser.add_argument("--demo", action="store_true", help="Load bundled sample data for UI verification")
+    parser.add_argument("--version", action="store_true", help="Show version and exit")
+    return parser.parse_args()
+
+
 def main():
-    ensure_root()
+    args = _parse_args()
+    if args.version:
+        print(f"n2-ng {__version__}")
+        sys.exit(0)
+    if not args.demo:
+        ensure_root()
     root = tk.Tk()
     root.withdraw()
-    splash = DependencySplash(root)
+    splash = DependencySplash(root, demo_mode=args.demo)
     if not splash.run():
         root.destroy()
         sys.exit(1)
-    app = N2NgApp(root)
+    app = N2NgApp(root, demo_mode=args.demo)
     root.deiconify()
     app.run()
 
