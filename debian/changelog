@@ -1,3 +1,12 @@
+n2-ng (0.1.0-2) kali-rolling; urgency=medium
+
+  * Fix beacons display in scan results.
+  * Fix BSSID column cutoff in capture window.
+  * Add sidescroll support to capture window.
+  * Improve font sizing relative to window/UX scaling.
+
+ -- KiMiGuEL — INDEPENTEST <Indepentest@gmail.com>  Mon, 20 Jul 2026 03:20:00 -0500
+
 n2-ng (0.1.0-1) kali-rolling; urgency=medium
 
   * Initial release.
