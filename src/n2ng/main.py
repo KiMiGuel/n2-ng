@@ -2231,7 +2231,6 @@ class N2NgApp:
             button.pack(side=tk.LEFT, padx=2)
 
         # Auto-refresh the capture-sessions history every 20 seconds.
-        self._schedule_history_refresh()
 
         self.history_empty_var = tk.StringVar(value="Tip: Select a file to reveal available actions. Right-click is also supported.")
         tk.Label(hist_frame, textvariable=self.history_empty_var, bg=THEME["panel"], fg=THEME["warn"], justify=tk.LEFT, wraplength=560).pack(anchor=tk.W, padx=5, pady=(2, 2))
