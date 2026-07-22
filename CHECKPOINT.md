@@ -1,6 +1,21 @@
 # CHECKPOINT — CPU spike diagnosis (n2-ng 0.1.1)
 
-## Status: ROOT CAUSE CONFIRMED — implementing fix
+## Status: FIX IMPLEMENTED + TESTS GREEN — caged verification next
+
+## Fix committed (2049944, version bump follows)
+1. `AirodumpRawView.append_lines`: batched — one config/insert-loop/trim/see
+   per flush, batch capped at MAX_LINES; per-line width=10 reconfigure gone.
+2. `AirodumpWorker._raw_lines`: bounded deque(maxlen=1000).
+3. `_poll_queue`: re-entrancy guard + "log" queue event.
+4. after() hygiene: `_cancel_after` helper; ids stored+cancelled for
+   capture-size monitor, `_poll_capture`, SignalGraph retry; all cancelled
+   in `_cleanup`.
+5. HashcatDialog + AttackController: worker→GUI via queue + after() pump.
+
+## Test status
+- 75/75 passed (test_helpers.py, test_ui.py) after fix and after version bump.
+- Version: 0.1.2 in __init__.py, main.py fallback, debian/changelog (0.1.2-1),
+  README.md, docs/INSTALL.md, test_helpers.py assertion.
 
 ## ROOT CAUSE (py-spy, two consecutive dumps, pid 73921)
 Main thread permanently inside:
@@ -32,10 +47,12 @@ hammered → whole-desktop freeze. Happens even with the Raw tab hidden.
 - No app code changes yet.
 
 ## Next step
-- Implement fix in src/n2ng/main.py, commit, then version bumps
-  (0.1.2), tests, caged verification (diag_run3 repro must stay idle-calm
-  through 3+ refresh cycles), final commit.
+- Caged verification with the exact freeze repro (diag_run3.py, Start
+  Monitor at t=5s): idle near-0% CPU pre-scan, main thread in mainloop
+  per py-spy, stable through 3+ 20s auto-refresh cycles (run ~150s).
+- Then final clean commit.
 
 ## If machine froze mid-step
-- Reboot; `git log` + this file resume. Kill leftovers:
+- Reboot; `git log` + this file resume. Fix and version bump are already
+  committed — what remains is verification + final commit. Kill leftovers:
   `systemctl --user stop n2ng-*.scope; sudo pkill -f n2ng_scan`
