@@ -876,7 +876,9 @@ class AirodumpWorker(threading.Thread):
         self._latest_networks: list[dict] = []
         self._latest_clients: list[dict] = []
         self._raw_lock = threading.Lock()
-        self._raw_lines: list[str] = []
+        # Bounded so a chatty airodump-ng can't grow memory between polls;
+        # the Raw View only renders the last MAX_LINES lines anyway.
+        self._raw_lines: deque[str] = deque(maxlen=1000)
         self._stdout_thread = None
 
     def _build_base_cmd(self, prefix: str) -> list[str]:
@@ -941,7 +943,7 @@ class AirodumpWorker(threading.Thread):
             self._running.clear()
             return False, str(e)
         with self._raw_lock:
-            self._raw_lines = []
+            self._raw_lines.clear()
         self._stdout_thread = threading.Thread(target=self._read_stdout, args=(self._proc,), daemon=True)
         self._stdout_thread.start()
         self._running.set()
@@ -1051,8 +1053,8 @@ class AirodumpWorker(threading.Thread):
 
     def get_raw_lines(self) -> list[str]:
         with self._raw_lock:
-            lines = self._raw_lines
-            self._raw_lines = []
+            lines = list(self._raw_lines)
+            self._raw_lines.clear()
         return lines
 
 
@@ -1063,6 +1065,7 @@ class SignalGraph:
         self.canvas = tk.Canvas(parent, bg=THEME["panel"], height=120, highlightthickness=0)
         self.canvas.pack(fill=tk.X, padx=5, pady=5)
         self.samples = deque(maxlen=60)
+        self._draw_after_id = None
 
     def add_sample(self, pwr):
         try:
@@ -1072,12 +1075,18 @@ class SignalGraph:
         self.samples.append(val)
         self._draw()
 
+    def _draw_retry(self):
+        self._draw_after_id = None
+        self._draw()
+
     def _draw(self):
         self.canvas.delete("all")
         w = self.canvas.winfo_width()
         h = self.canvas.winfo_height()
         if w < 10:
-            self.canvas.after(100, self._draw)
+            # Single pending retry only — never stack after() chains.
+            if self._draw_after_id is None:
+                self._draw_after_id = self.canvas.after(100, self._draw_retry)
             return
         for y in range(0, h, 20):
             self.canvas.create_line(0, y, w, y, fill="#333333")
@@ -1492,6 +1501,7 @@ class HashcatDialog(tk.Toplevel):
         self.hash_file = hash_file
         self.proc = None
         self.thread = None
+        self._out_queue = queue.Queue()
         self.session_name = f"n2ng-{int(time.time())}"
         self.title("N2-ng Hashcat")
         self.configure(bg=THEME["panel"])
@@ -1563,16 +1573,33 @@ class HashcatDialog(tk.Toplevel):
         self.stop_btn.config(state=tk.NORMAL)
         self.thread = threading.Thread(target=self._run_hashcat, args=(cmd,), daemon=True)
         self.thread.start()
+        self.after(150, self._pump_output)
 
     def _run_hashcat(self, cmd: list[str]):
+        # Worker thread: never touch Tk from here, just feed the queue.
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in self.proc.stdout:
-            self.after(0, self._append, line)
+            self._out_queue.put(("line", line))
         rc = self.proc.wait()
         state = "cracked/exhausted" if rc == 0 else ("aborted" if rc in (130, 143, -15) else "failed")
-        self.after(0, self._append, f"\nHashcat exited {rc}: {state}\n")
-        self.after(0, self.start_btn.config, {"state": tk.NORMAL})
-        self.after(0, self.stop_btn.config, {"state": tk.DISABLED})
+        self._out_queue.put(("done", (rc, state)))
+
+    def _pump_output(self):
+        """Main-thread pump draining hashcat output into the widget."""
+        while True:
+            try:
+                kind, payload = self._out_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "line":
+                self._append(payload)
+            else:
+                rc, state = payload
+                self._append(f"\nHashcat exited {rc}: {state}\n")
+                self.start_btn.config(state=tk.NORMAL)
+                self.stop_btn.config(state=tk.DISABLED)
+        if (self.thread and self.thread.is_alive()) or not self._out_queue.empty():
+            self.after(150, self._pump_output)
 
     def _stop(self):
         if self.proc and self.proc.poll() is None:
@@ -1694,33 +1721,45 @@ class AirodumpRawView:
 
     def flush(self):
         """Call from tkinter main thread to drain queued lines."""
-        updated = False
+        lines = []
         while not self.queue.empty():
             try:
-                line = self.queue.get_nowait()
+                lines.append(self.queue.get_nowait())
             except queue.Empty:
                 break
-            self._append_line(line)
-            updated = True
-        return updated
+        if not lines:
+            return False
+        self.append_lines(lines)
+        return True
 
     def append_lines(self, lines: list[str]):
-        for line in lines:
-            self._append_line(line)
+        """Append a batch of lines with a single layout pass.
 
-    def _append_line(self, line: str):
+        airodump-ng redraws its ANSI screen continuously, so lines arrive in
+        floods.  Per-line see()/config()/trim used to starve the Tk event
+        loop (100% CPU, frozen GUI); everything is batched here instead.
+        """
+        if not lines:
+            return
+        # Anything beyond MAX_LINES is trimmed away below; skip the extra work.
+        if len(lines) > self.MAX_LINES:
+            lines = lines[-self.MAX_LINES:]
         self.text.config(state=tk.NORMAL)
-        plain, tags = self.ansi.parse(line)
-        self.text.insert(tk.END, plain + "\n")
-        line_start = self.text.index("end-2l linestart")
-        for tag_name, start, end in tags:
-            self.text.tag_add(tag_name, f"{line_start}+{start}c", f"{line_start}+{end}c")
-        # Trim old lines.
+        for line in lines:
+            plain, tags = self.ansi.parse(line)
+            self.text.insert(tk.END, plain + "\n")
+            line_start = self.text.index("end-2l linestart")
+            for tag_name, start, end in tags:
+                self.text.tag_add(tag_name, f"{line_start}+{start}c", f"{line_start}+{end}c")
+        # Trim old lines once per batch.
         count = int(self.text.index("end-1c").split(".")[0]) - 1
         if count > self.MAX_LINES:
             self.text.delete("1.0", f"{count - self.MAX_LINES}.0")
         self.text.see(tk.END)
-        self.text.config(state=tk.DISABLED, width=10)
+        self.text.config(state=tk.DISABLED)
+
+    def _append_line(self, line: str):
+        self.append_lines([line])
 
 
 class SettingsDialog(tk.Toplevel):
@@ -1854,7 +1893,7 @@ class N2NgApp:
         self.airmon = AirmonManager()
         self.worker = AirodumpWorker(self.queue, self.settings)
         self.capture_manager = CaptureManager(self.queue, self._log)
-        self.attack = AttackController(self._log)
+        self.attack = AttackController(lambda msg: self.queue.put(("log", msg)))
 
         self.networks: dict[str, dict] = {}
         self._networks_prev: dict[str, dict] = {}
@@ -1864,6 +1903,9 @@ class N2NgApp:
         self.current_band = tk.StringVar(value="Both")
         self.adapter_var = tk.StringVar()
         self.poll_id = None
+        self._poll_running = False
+        self._capture_size_after_id = None
+        self._poll_capture_after_id = None
         self._last_network_signature = None
         self._last_client_signature = None
         self._cleanup_done = False
@@ -2838,6 +2880,7 @@ class N2NgApp:
         self.target_label.config(text="\n".join(lines))
 
     def _start_capture_size_monitor(self):
+        self._cancel_after("_capture_size_after_id")
         if not self.locked_target:
             return
         # Find the latest .cap in the target directory
@@ -2847,13 +2890,14 @@ class N2NgApp:
             size = caps[-1].stat().st_size
             self.size_label.config(text=f"Capture: {human_size(size)}")
         if self.locked_target:
-            self.root.after(1000, self._start_capture_size_monitor)
+            self._capture_size_after_id = self.root.after(1000, self._start_capture_size_monitor)
 
     def _poll_capture(self):
+        self._cancel_after("_poll_capture_after_id")
         if self.capture_manager:
             self.capture_manager.poll()
         if self.locked_target:
-            self.root.after(5000, self._poll_capture)
+            self._poll_capture_after_id = self.root.after(5000, self._poll_capture)
 
     # ------------------------------------------------------------------
     # Attack handlers
@@ -2946,39 +2990,49 @@ class N2NgApp:
         re-renders the UI at ~6.7 FPS.  One-off events (handshake/pmkid/
         errors) are drained from the queue without blocking on capture.
         """
-        # Always refresh display from the shared buffer.
-        if self.worker:
-            networks, clients = self.worker.get_latest()
-            network_signature = tuple(tuple(sorted(net.items())) for net in networks)
-            client_signature = tuple(tuple(sorted(client.items())) for client in clients)
-            if network_signature != self._last_network_signature:
-                self._last_network_signature = network_signature
-                self._update_networks(networks)
-            if client_signature != self._last_client_signature:
-                self._last_client_signature = client_signature
-                self._update_clients(clients)
-            self._check_channel_lock()
+        if self._poll_running:
+            # Previous cycle is still running; never overlap refresh cycles.
+            self.poll_id = self.root.after(150, self._poll_queue)
+            return
+        self._poll_running = True
+        try:
+            # Always refresh display from the shared buffer.
+            if self.worker:
+                networks, clients = self.worker.get_latest()
+                network_signature = tuple(tuple(sorted(net.items())) for net in networks)
+                client_signature = tuple(tuple(sorted(client.items())) for client in clients)
+                if network_signature != self._last_network_signature:
+                    self._last_network_signature = network_signature
+                    self._update_networks(networks)
+                if client_signature != self._last_client_signature:
+                    self._last_client_signature = client_signature
+                    self._update_clients(clients)
+                self._check_channel_lock()
 
-        # Drain asynchronous events.
-        while not self.queue.empty():
-            try:
-                event, payload = self.queue.get_nowait()
-            except queue.Empty:
-                break
-            if event == "handshake":
-                self._notify_capture("WPA Handshake Captured", payload["file"])
-            elif event == "pmkid":
-                self._notify_capture("PMKID Captured", payload["file"])
-            elif event == "wps_line":
-                self.wps_lines.append(payload)
-                self._update_wps_text()
-            elif event == "error":
-                self._log(f"ERROR: {payload}")
+            # Drain asynchronous events.
+            while not self.queue.empty():
+                try:
+                    event, payload = self.queue.get_nowait()
+                except queue.Empty:
+                    break
+                if event == "handshake":
+                    self._notify_capture("WPA Handshake Captured", payload["file"])
+                elif event == "pmkid":
+                    self._notify_capture("PMKID Captured", payload["file"])
+                elif event == "wps_line":
+                    self.wps_lines.append(payload)
+                    self._update_wps_text()
+                elif event == "log":
+                    self._log(payload)
+                elif event == "error":
+                    self._log(f"ERROR: {payload}")
 
-        # Update Raw View if it exists.
-        if self.raw_view:
-            self.raw_view.append_lines(self.worker.get_raw_lines())
-            self.raw_view.flush()
+            # Update Raw View if it exists (batched, bounded to MAX_LINES).
+            if self.raw_view and self.worker:
+                self.raw_view.append_lines(self.worker.get_raw_lines())
+                self.raw_view.flush()
+        finally:
+            self._poll_running = False
 
         self.poll_id = self.root.after(150, self._poll_queue)
 
@@ -3524,18 +3578,29 @@ class N2NgApp:
         self._cleanup()
         self.root.destroy()
 
+    def _cancel_after(self, attr: str):
+        """Cancel a pending after() timer stored in ``attr`` and clear it."""
+        timer_id = getattr(self, attr, None)
+        if timer_id is not None:
+            try:
+                self.root.after_cancel(timer_id)
+            except tk.TclError:
+                pass
+            setattr(self, attr, None)
+
     def _cleanup(self):
         if self._cleanup_done:
             return
         self._cleanup_done = True
-        for attr in ("poll_id", "_resize_after_id", "_history_refresh_id", "_channel_lock_timer_id"):
-            timer_id = getattr(self, attr, None)
-            if timer_id is not None:
-                try:
-                    self.root.after_cancel(timer_id)
-                except tk.TclError:
-                    pass
-                setattr(self, attr, None)
+        for attr in (
+            "poll_id",
+            "_resize_after_id",
+            "_history_refresh_id",
+            "_channel_lock_timer_id",
+            "_capture_size_after_id",
+            "_poll_capture_after_id",
+        ):
+            self._cancel_after(attr)
         if hasattr(self, "wps_scanner"):
             self.wps_scanner.stop()
         self.attack.stop_current()
