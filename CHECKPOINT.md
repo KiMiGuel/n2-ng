@@ -1,35 +1,46 @@
 # CHECKPOINT — CPU spike diagnosis (n2-ng 0.1.1)
 
-## Status: RUNTIME DIAGNOSIS — no app code changes yet
+## Status: ROOT CAUSE NARROWED — reproducing with instrumentation next
 
-## Hypotheses (confirm with py-spy, priority order)
-1. Competing/stacking `after()` loops (schedule without cancel)
-2. Busy-wait subprocess/pipe polling without sleep
-3. Worker threads touching Tk widgets / threads piling up
-4. Unbounded tree rebuild every refresh
-5. scapy sniffing on main thread
+## CONFIRMED reproduction (user + caged run, 2026-07-21 ~22:20)
+- Real mode, click through splash, hit "Start Monitor" (adapter wlan0monmon)
+  → airodump-ng starts → GUI freezes.
+- Evidence captured before the caged process hit its timeout:
+  - main python (root) in state **R at ~18.7% CPU** (cage cap 40%) — main
+    thread spinning in Python, NOT sitting in the Tcl event loop.
+  - airodump-ng child at ~16.7% (expected, it channel-hops).
+- py-spy dump missed the process by seconds (timeout killed it). Next run
+  uses a longer timeout and a self-driving harness so py-spy attaches in time.
 
-## Static analysis findings (main.py)
-- `SignalGraph._draw` (main.py:1075-1081): reschedules `after(100, _draw)`
-  every call while canvas width <10, and `add_sample` calls `_draw` directly —
-  stacking `after()` chains possible while unmapped. Lead suspect.
-- `AirodumpWorker`: blocking stdout reader thread + 200ms CSV poll — clean.
-- `_poll_queue` (150ms) and `_schedule_history_refresh` (20s) self-reschedule
-  once each — look single-chain.
-- Normal launch re-execs via sudo (`ensure_root`) and splash needs a click,
-  so diagnosis uses `diag_run.py` (demo mode, direct app instantiation).
+## Ruled out
+- Idle demo launch: 1.6% CPU, mainloop idle. Not the bug.
+- Simulated locked-scan feed (FakeWorker, incl. Raw-tab switch): ~2%, calm.
+- Startup dependency checks (incl. hashcat -I): bounded one-off.
+- Static review: AirodumpWorker (blocking reads + 200ms sleep), WpsScanner
+  (blocking readline), Raw view (500-line cap), resize handler (debounced) —
+  all clean.
 
-## What's been changed
-- Added `diag_run.py` (diagnosis harness only, not app code).
+## Remaining suspects in the Start Monitor → scan path
+- `SignalGraph._draw` stacking after() chains while canvas unmapped (main.py:1075)
+- `_poll_queue` → `_update_networks` → `_refresh_tree` per-150ms `tree.move()`
+  storm with real scan data
+- `Raw View` append of airodump stdout every 150 ms
+- `_refresh_history` rglob over a large ~/hs tree (20s cycle)
+
+## What's been changed (all committed)
+- CHECKPOINT.md, diag_run.py, diag_run2.py, diag_click.py (harnesses only)
+- No app code changes.
 
 ## Next step
-- Caged run:
-  `systemd-run --user --scope -p CPUQuota=40% -p MemoryMax=1G timeout 90s venv/bin/python diag_run.py`
-- Attach: `venv/bin/py-spy top --pid <pid>` and `py-spy dump --pid <pid>`.
-- Confirm hot function, THEN fix.
+- diag_run3.py: non-demo harness (run as root via sudo -n), sets
+  adapter_var=wlan0monmon, calls app._start_monitor() at t=5s.
+- Caged: `systemd-run --user --scope -p CPUQuota=40% -p MemoryMax=1G
+  timeout 180s sudo -n env DISPLAY=:0.0 XAUTHORITY=/home/kali/.Xauthority
+  venv/bin/python diag_run3.py`
+- At t≈10s: `sudo -n venv/bin/py-spy dump --pid <root-python-pid>` + py-spy top.
+- After run: kill orphaned airodump-ng (`sudo pkill -f n2ng_scan`).
 
 ## If machine froze mid-step
-- Reboot, `git log` + this file are the resume point. No app code modified;
-  the stock 0.1.1 build still carries the freeze risk — never launch `n2-ng`
-  bare, always inside the systemd-run cage above (swap `n2-ng` for the
-  launcher path when testing the real entry point).
+- Reboot; `git log` + this file resume the work. The cage caps CPU at 40%
+  so a full freeze is unlikely; if the GUI is just stuck, the scope is
+  `systemctl --user stop n2ng-*.scope` and `sudo pkill -f n2ng_scan`.
