@@ -8,6 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/KiMiGuel/n2-ng/releases"><img src="https://img.shields.io/github/v/release/KiMiGuel/n2-ng?style=flat-square&color=%2300ff41&label=release" alt="Release"></a>
+  <img src="https://img.shields.io/badge/version-0.1.3-%2300ff41?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square" alt="License">
   <img src="https://img.shields.io/badge/Kali-compatible-purple?style=flat-square" alt="Kali">
@@ -74,13 +75,6 @@ sudo ./install.sh
 
 # Launch
 n2-ng
-```
-
-Or install from the Debian package:
-
-```bash
-sudo dpkg -i n2-ng_0.1.1-1_all.deb
-sudo apt-get install -f   # resolve any dependencies
 ```
 
 ---
@@ -152,11 +146,3 @@ GPL-3.0. See [LICENSE](LICENSE).
 <p align="center">
   <sub>By <b>KiMiGuEL</b> — <a href="https://github.com/KiMiGuel">INDEPENTEST</a></sub>
 </p>
-
-## Kali Official Repository (In Review)
-
-N2-NG has been submitted for inclusion in Kali Linux repositories.
-
-- **Bug ID:** [0009789](https://bugs.kali.org/view.php?id=0009789)
-- **Status:** Under review for kali-bleeding-edge, with potential promotion to kali-rolling
-- **Current install method:** Use the APT repo above until official inclusion

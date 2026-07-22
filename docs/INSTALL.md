@@ -17,17 +17,6 @@ python3 -m pip install .
 n2-ng
 ```
 
-## APT Repo Method
-
-The APT repository is a bleeding-edge goal. Until packages are published, use the Git clone method or build the Debian package locally:
-
-```bash
-sudo apt update
-sudo apt install -y debhelper dh-python python3-setuptools python3-tk aircrack-ng wireless-tools
-dpkg-buildpackage -us -uc -b
-sudo apt install ../n2-ng_0.1.1-1_all.deb
-```
-
 ## Dependencies
 
 - `aircrack-ng`

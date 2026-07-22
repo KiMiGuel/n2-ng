@@ -1,6 +1,29 @@
 # CHECKPOINT — CPU spike diagnosis (n2-ng 0.1.1)
 
-## Status: FIX IMPLEMENTED + TESTS GREEN — caged verification next
+## Status: ALL FIXES COMMITTED (9796395, v0.1.3) — final caged verification
+
+## Fixes in 9796395 + 2049944
+1. Raw View appends batched (single layout pass, MAX_LINES cap per batch).
+2. `_raw_lines` bounded deque(maxlen=1000).
+3. Raw View renders only while its tab is visible; backlog catch-up on show.
+4. `_poll_queue` re-entrancy guard; "log" queue event.
+5. after() hygiene: `_cancel_after`, ids for capture monitors + SignalGraph
+   retry, all cancelled in `_cleanup`.
+6. Hashcat/attack worker output via queue + after() pump.
+7. Clients panel STATION column width measured from mono font (+rescale).
+- Version 0.1.3 in code + test assertion. Debian packaging UNTOUCHED
+  (submission declined; changelog/README/INSTALL restored to 0.1.1 state).
+- 75/75 tests pass.
+
+## Next step
+- Final caged verification (diag_run3.py, Start Monitor at t=5s, 150s):
+  idle near-0% pre-scan, main thread in mainloop during scan per py-spy,
+  stable through 3+ 20s auto-refresh cycles.
+- Then: final clean commit + live-test instructions.
+
+## If machine froze mid-step
+- Reboot; everything is committed. Only verification + final commit remain.
+  Kill leftovers: `systemctl --user stop n2ng-*.scope; sudo pkill -f n2ng_scan`
 
 ## Fix committed (2049944, version bump follows)
 1. `AirodumpRawView.append_lines`: batched — one config/insert-loop/trim/see

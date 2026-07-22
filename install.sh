@@ -24,10 +24,6 @@ fi
 apt-get update
 apt-get install -y \
     aircrack-ng \
-    build-essential \
-    debhelper \
-    dh-python \
-    dpkg-dev \
     git \
     python3 \
     python3-pip \
@@ -42,15 +38,7 @@ if [ ! -f setup.py ]; then
     cd "$WORKDIR/n2-ng"
 fi
 
-python3 setup.py sdist >/dev/null
-
-if dpkg-buildpackage -us -uc -b; then
-    DEB="$(find .. -maxdepth 1 -name 'n2-ng_*.deb' | sort | tail -n 1)"
-    apt-get install -y "$DEB"
-else
-    echo "dpkg-buildpackage failed; falling back to pip install."
-    python3 -m pip install .
-fi
+python3 -m pip install .
 
 # Add a convenient alias for the source-tree launcher when installing from git.
 add_alias() {

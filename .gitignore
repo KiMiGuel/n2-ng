@@ -11,8 +11,4 @@ __pycache__/
 *.log.csv
 build/
 dist/
-debian/.debhelper/
-debian/debhelper-build-stamp
-debian/files
-debian/n2-ng/
 *.deb
