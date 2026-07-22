@@ -848,6 +848,8 @@ def test_raw_view_flushes_worker_raw_lines_without_own_process():
     app.worker.get_latest = Mock(return_value=([], []))
     app.worker.get_raw_lines = Mock(return_value=["BSSID PWR CH ESSID", "AA:BB:CC:DD:EE:FF -50 6 Net"])
     app.raw_view.start = Mock()
+    # The Raw View only updates while its tab is selected.
+    app.notebook.select(app._raw_tab)
 
     app._poll_queue()
 

@@ -79,7 +79,7 @@ n2-ng
 Or install from the Debian package:
 
 ```bash
-sudo dpkg -i n2-ng_0.1.2-1_all.deb
+sudo dpkg -i n2-ng_0.1.1-1_all.deb
 sudo apt-get install -f   # resolve any dependencies
 ```
 

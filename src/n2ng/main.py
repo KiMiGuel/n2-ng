@@ -27,7 +27,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 try:
     from . import __version__
 except ImportError:
-    __version__ = "0.1.2"
+    __version__ = "0.1.3"
 
 
 THEME = {
@@ -2041,6 +2041,8 @@ class N2NgApp:
             return
         mac_width = self._mono_font.measure("00:00:00:00:00:00") + 24
         self.tree.column("bssid", width=mac_width, minwidth=mac_width)
+        if hasattr(self, "client_tree") and self.client_tree.winfo_exists():
+            self.client_tree.column("station", width=mac_width, minwidth=mac_width)
         # Scale other columns relative to the base 10pt size.
         base_size = self._mono_font.cget("size")
         ratio = max(0.8, min(1.6, base_size / 10))
@@ -2082,6 +2084,7 @@ class N2NgApp:
 
         raw_tab = tk.Frame(self.notebook, bg=THEME["bg"])
         self.notebook.add(raw_tab, text="Raw View")
+        self._raw_tab = raw_tab
         self._build_raw_view(raw_tab)
 
         self._build_log_pane()
@@ -2224,9 +2227,11 @@ class N2NgApp:
         client_frame = tk.LabelFrame(parent, text="Clients", bg=THEME["panel"], fg=THEME["fg"])
         client_frame.pack(fill=tk.X, padx=5, pady=5)
         self.client_tree = ttk.Treeview(client_frame, columns=("station", "pwr", "pkts", "probed"), show="headings", height=5)
-        for c, h in (("station", "STATION"), ("pwr", "PWR"), ("pkts", "Pkts"), ("probed", "Probed ESSID")):
+        # Measure the STATION column from the mono font so MACs are never cut off.
+        station_width = self._mono_font.measure("00:00:00:00:00:00") + 24
+        for c, h, w in (("station", "STATION", station_width), ("pwr", "PWR", 90), ("pkts", "Pkts", 90), ("probed", "Probed ESSID", 90)):
             self.client_tree.heading(c, text=h)
-            self.client_tree.column(c, width=90)
+            self.client_tree.column(c, width=w, minwidth=w if c == "station" else 40)
         self.client_tree.pack(fill=tk.X)
         self.client_tree.bind("<Button-3>", self._on_client_right_click)
 
@@ -3027,9 +3032,12 @@ class N2NgApp:
                 elif event == "error":
                     self._log(f"ERROR: {payload}")
 
-            # Update Raw View if it exists (batched, bounded to MAX_LINES).
-            if self.raw_view and self.worker:
+            # Update the Raw View only while its tab is on screen; the
+            # worker's bounded buffer keeps a backlog, so the view catches
+            # up in a single batch when the tab is shown again.
+            if self.raw_view and self.worker and self.notebook.select() == str(self._raw_tab):
                 self.raw_view.append_lines(self.worker.get_raw_lines())
+            if self.raw_view:
                 self.raw_view.flush()
         finally:
             self._poll_running = False

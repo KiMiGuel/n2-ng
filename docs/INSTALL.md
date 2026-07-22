@@ -25,7 +25,7 @@ The APT repository is a bleeding-edge goal. Until packages are published, use th
 sudo apt update
 sudo apt install -y debhelper dh-python python3-setuptools python3-tk aircrack-ng wireless-tools
 dpkg-buildpackage -us -uc -b
-sudo apt install ../n2-ng_0.1.2-1_all.deb
+sudo apt install ../n2-ng_0.1.1-1_all.deb
 ```
 
 ## Dependencies

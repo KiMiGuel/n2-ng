@@ -1,18 +1,3 @@
-n2-ng (0.1.2-1) kali-rolling; urgency=medium
-
-  * Fix 100% CPU / GUI freeze when starting monitor mode: airodump-ng's
-    continuous ANSI screen redraws flooded the Raw View, whose per-line
-    widget updates starved the Tk event loop. Raw View updates are now
-    batched (single layout pass per refresh, capped at MAX_LINES) and the
-    worker's raw-line buffer is bounded.
-  * Add a re-entrancy guard to the display refresh loop and enforce
-    single self-rescheduling after() chains (capture size monitor, capture
-    poll, signal graph retry), with all timers cancelled on window close.
-  * Route hashcat and attack output to the UI via queue + after() pump
-    instead of touching Tk widgets from worker threads.
-
- -- KiMiGuEL — INDEPENTEST <Indepentest@gmail.com>  Tue, 21 Jul 2026 22:37:00 -0700
-
 n2-ng (0.1.1-1) kali-rolling; urgency=medium
 
   * Improve responsive UI sizing and adapter refresh typography.
