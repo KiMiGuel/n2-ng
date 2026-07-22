@@ -1,46 +1,41 @@
 # CHECKPOINT — CPU spike diagnosis (n2-ng 0.1.1)
 
-## Status: ROOT CAUSE NARROWED — reproducing with instrumentation next
+## Status: ROOT CAUSE CONFIRMED — implementing fix
 
-## CONFIRMED reproduction (user + caged run, 2026-07-21 ~22:20)
-- Real mode, click through splash, hit "Start Monitor" (adapter wlan0monmon)
-  → airodump-ng starts → GUI freezes.
-- Evidence captured before the caged process hit its timeout:
-  - main python (root) in state **R at ~18.7% CPU** (cage cap 40%) — main
-    thread spinning in Python, NOT sitting in the Tcl event loop.
-  - airodump-ng child at ~16.7% (expected, it channel-hops).
-- py-spy dump missed the process by seconds (timeout killed it). Next run
-  uses a longer timeout and a self-driving harness so py-spy attaches in time.
+## ROOT CAUSE (py-spy, two consecutive dumps, pid 73921)
+Main thread permanently inside:
+`_poll_queue` (main.py:2980) → `AirodumpRawView.append_lines` (1709)
+→ `_append_line` (1711-1723) → `text.see(tk.END)` / `text.config(...)`
 
-## Ruled out
-- Idle demo launch: 1.6% CPU, mainloop idle. Not the bug.
-- Simulated locked-scan feed (FakeWorker, incl. Raw-tab switch): ~2%, calm.
-- Startup dependency checks (incl. hashcat -I): bounded one-off.
-- Static review: AirodumpWorker (blocking reads + 200ms sleep), WpsScanner
-  (blocking readline), Raw view (500-line cap), resize handler (debounced) —
-  all clean.
+Mechanism: Start Monitor launches airodump-ng with stdout=PIPE. airodump
+redraws its full ANSI screen continuously → `_read_stdout` floods the
+unbounded `_raw_lines` buffer. Every 150 ms `_poll_queue` appends ALL
+accumulated lines to the Raw View Text widget, and EACH line costs:
+config(NORMAL) + insert + index + tag_add + count/top-delete trim +
+see(END) + config(DISABLED, width=10). Per-line `see` + double reconfigure
++ top-deletes on a 500-line widget = O(n^2) Tk layout churn on the main
+thread → event loop starved → frozen GUI, one core at 100%, X server
+hammered → whole-desktop freeze. Happens even with the Raw tab hidden.
 
-## Remaining suspects in the Start Monitor → scan path
-- `SignalGraph._draw` stacking after() chains while canvas unmapped (main.py:1075)
-- `_poll_queue` → `_update_networks` → `_refresh_tree` per-150ms `tree.move()`
-  storm with real scan data
-- `Raw View` append of airodump stdout every 150 ms
-- `_refresh_history` rglob over a large ~/hs tree (20s cycle)
+## Fix plan (minimal, no feature/UI changes)
+1. Batch Raw View appends: one config/insert-loop/trim/see per flush,
+   cap batch at MAX_LINES; drop per-line width=10 reconfigure.
+2. Bound `_raw_lines` producer buffer (deque maxlen).
+3. Re-entrancy guard on `_poll_queue`.
+4. after() hygiene: store + cancel ids for SignalGraph._draw,
+   _start_capture_size_monitor, _poll_capture; cancel all in _cleanup.
+5. HashcatDialog: worker→GUI via queue + after pump (no after() from
+   the reader thread).
 
 ## What's been changed (all committed)
-- CHECKPOINT.md, diag_run.py, diag_run2.py, diag_click.py (harnesses only)
-- No app code changes.
+- CHECKPOINT.md, diag_run.py, diag_run2.py, diag_run3.py, diag_click.py
+- No app code changes yet.
 
 ## Next step
-- diag_run3.py: non-demo harness (run as root via sudo -n), sets
-  adapter_var=wlan0monmon, calls app._start_monitor() at t=5s.
-- Caged: `systemd-run --user --scope -p CPUQuota=40% -p MemoryMax=1G
-  timeout 180s sudo -n env DISPLAY=:0.0 XAUTHORITY=/home/kali/.Xauthority
-  venv/bin/python diag_run3.py`
-- At t≈10s: `sudo -n venv/bin/py-spy dump --pid <root-python-pid>` + py-spy top.
-- After run: kill orphaned airodump-ng (`sudo pkill -f n2ng_scan`).
+- Implement fix in src/n2ng/main.py, commit, then version bumps
+  (0.1.2), tests, caged verification (diag_run3 repro must stay idle-calm
+  through 3+ refresh cycles), final commit.
 
 ## If machine froze mid-step
-- Reboot; `git log` + this file resume the work. The cage caps CPU at 40%
-  so a full freeze is unlikely; if the GUI is just stuck, the scope is
-  `systemctl --user stop n2ng-*.scope` and `sudo pkill -f n2ng_scan`.
+- Reboot; `git log` + this file resume. Kill leftovers:
+  `systemctl --user stop n2ng-*.scope; sudo pkill -f n2ng_scan`
