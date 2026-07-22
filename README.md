@@ -116,19 +116,6 @@ All optional deps are checked at runtime — the tool warns you if something's m
 
 ---
 
-## Roadmap
-
-- [x] Core GUI with live scan
-- [x] Auto-handshake detection
-- [x] Settings dialog (output formats, sort, filters)
-- [ ] Clickable column sorting (high/low toggle)
-- [ ] Cap merge/fix UI button (currently right-click only)
-- [ ] PMKID-dedicated capture mode
-- [ ] Dark/light theme toggle
-- [ ] Export to hashcat (`-m 22000`) one-click
-
----
-
 ## Contributing
 
 Found a bug? Got an idea? See [CONTRIBUTING.md](CONTRIBUTING.md).
