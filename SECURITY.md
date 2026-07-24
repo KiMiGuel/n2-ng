@@ -1,42 +1,42 @@
-# Security Policy
+# Política de Seguridad
 
-## Supported Versions
+## Versiones Soportadas
 
-| Version | Supported |
+| Versión | Soportada |
 |---------|-----------|
 | 0.1.x   | ✅         |
 
-## Reporting a Vulnerability
+## Reportar una Vulnerabilidad
 
-Found a security issue in N2-NG itself? (Not a WiFi network — the tool.)
+¿Encontraste un problema de seguridad en N2-NG en sí? (No en una red WiFi — en la herramienta.)
 
-**Do NOT open a public issue.**
+**NO abras un issue público.**
 
-Instead:
-1. Email **KiMiGuel via GitHub** or DM through the repo
-2. Include:
-   - Description of the vulnerability
-   - Steps to reproduce
-   - Potential impact
-   - Suggested fix (if any)
+En su lugar:
+1. Escribe a **KiMiGuel vía GitHub** o envía un DM a través del repo
+2. Incluye:
+   - Descripción de la vulnerabilidad
+   - Pasos para reproducirla
+   - Impacto potencial
+   - Corrección sugerida (si la hay)
 
-You'll get a response within **7 days**. If confirmed, we'll:
-- Acknowledge your report
-- Work on a fix
-- Credit you in the release notes (with your permission)
+Recibirás una respuesta en un plazo de **7 días**. Si se confirma, nosotros:
+- Reconoceremos tu reporte
+- Trabajaremos en una corrección
+- Te daremos crédito en las notas de la versión (con tu permiso)
 
-## Scope
+## Alcance
 
-This tool is for **authorized penetration testing only**. By using N2-NG, you agree to:
-- Only test networks you own or have explicit written permission to test
-- Follow all local laws regarding wireless scanning and packet injection
-- Not use this tool for illegal activity
+Esta herramienta es **solo para pruebas de penetración autorizadas**. Al usar N2-NG, aceptas:
+- Auditar únicamente redes de tu propiedad o con permiso explícito por escrito
+- Cumplir todas las leyes locales relativas al escaneo inalámbrico y la inyección de paquetes
+- No usar esta herramienta para actividades ilegales
 
-The INDEPENTEST team is not responsible for misuse of this tool.
+El equipo INDEPENTEST no se hace responsable del mal uso de esta herramienta.
 
-## Disclosure Timeline
+## Cronología de Divulgación
 
-- **Day 0**: Report received
-- **Day 7**: Initial response + triage
-- **Day 30**: Fix released (critical issues faster)
-- **Day 37**: Public disclosure (after fix is available)
+- **Día 0**: Reporte recibido
+- **Día 7**: Respuesta inicial + triaje
+- **Día 30**: Corrección publicada (los problemas críticos, antes)
+- **Día 37**: Divulgación pública (una vez disponible la corrección)

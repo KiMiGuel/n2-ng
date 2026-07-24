@@ -1,9 +1,13 @@
 <p align="center">
+  <b>For English, click <a href="https://github.com/KiMiGuel/n2-ng/blob/main/README.md">here</a>.</b>
+</p>
+
+<p align="center">
   <img src="docs/n2-ng-banner.png" alt="N2-NG Banner" width="100%">
 </p>
 
 <p align="center">
-  <b>One window. One adapter. Zero terminal juggling.</b>
+  <b>Una ventana. Un adaptador. Cero malabares con terminales.</b>
 </p>
 
 <p align="center">
@@ -17,122 +21,122 @@
 
 ---
 
-## The Problem
+## El Problema
 
-You know the aircrack-ng suite is the best. You also know it has the UX of a 1990s router admin panel.
+Ya sabes que la suite aircrack-ng es la mejor. También sabes que tiene la experiencia de usuario de un panel de administración de router de los años 90.
 
-Three terminal windows. A cheat sheet. A prayer. Channel mismatch isn't a feature — it's a cry for help. Nobody should type `aireplay-ng --help` at 3 AM and question their life choices.
+Tres ventanas de terminal. Una chuleta de comandos. Un rezo. El mismatch de canal no es una función — es un grito de auxilio. Nadie debería escribir `aireplay-ng --help` a las 3 de la mañana y cuestionar sus decisiones de vida.
 
-## The Solution
+## La Solución
 
-**N2-NG** wraps `airmon-ng` / `airodump-ng` / `aireplay-ng` into a single tkinter interface with actual words on buttons ("Deauthenticate," not "-0"), auto-handshake detection, live channel hopping, and none of the WEP museum exhibits.
+**N2-NG** envuelve `airmon-ng` / `airodump-ng` / `aireplay-ng` en una sola interfaz tkinter con palabras de verdad en los botones ("Deauthenticate", no "-0"), detección automática de handshakes, channel hopping en vivo y ninguna de las piezas de museo de WEP.
 
-Built for **Kali Linux**. Tested on caffeine. Approved by anyone who's ever forgotten which terminal had the monitor-mode adapter.
+Hecho para **Kali Linux**. Probado con cafeína. Aprobado por cualquiera que haya olvidado alguna vez en qué terminal estaba el adaptador en monitor mode.
 
 ---
 
-## Screenshots
+## Capturas de Pantalla
 
 <p align="center">
   <img src="docs/screenshot-gui.png" alt="N2-NG Main Interface" width="90%">
-  <br><sub><i>Main interface — live scan with sortable columns, target panel, and client list</i></sub>
+  <br><sub><i>Interfaz principal — escaneo en vivo con columnas ordenables, panel de objetivo y lista de clientes</i></sub>
 </p>
 
 <p align="center">
   <img src="docs/screenshot-handshake.png" alt="WPA Handshake Capture" width="45%">
   &nbsp;
   <img src="docs/screenshot-settings.png" alt="Airodump Settings" width="45%">
-  <br><sub><i>Left: Auto-handshake detection popup &nbsp;|&nbsp; Right: Configurable scan settings</i></sub>
+  <br><sub><i>Izquierda: aviso emergente de detección automática de handshake &nbsp;|&nbsp; Derecha: ajustes de escaneo configurables</i></sub>
 </p>
 
 ---
 
-## Features
+## Funciones
 
-| Feature | N2-NG | Raw aircrack-ng |
-|---------|-------|-----------------|
-| Single-window interface | ✅ | ❌ (3+ terminals) |
-| Human-readable buttons ("Deauth" not `-0`) | ✅ | ❌ |
-| Live channel-hopping scan | ✅ | Manual `-C` flags |
-| Auto-handshake detection | ✅ | Wireshark eyeballing |
-| Handshake verification gate (messagepair: AUTHORIZED vs challenge-only) | ✅ (v1.1) | ❌ |
-| Auto .22000 hash extraction (capture/fix/merge/lazy) | ✅ (v1.1) | Manual `hcxpcapngtool` runs |
-| Real-time BSSID/PWR/Beacons/#Data/CH/MB/ENC/CIPHER/AUTH/ESSID | ✅ | `airodump-ng` output |
-| Sortable columns (PWR, Beacons, #Data) | ✅ | ❌ |
-| Right-click context menu (cap merge/fix) | ✅ | Manual `mergecap` |
-| .cap / .pcap / .22000 export | ✅ | Separate tools |
-| Configurable output formats (csv, pcap, kismet) | ✅ | `-w` prefix only |
-| Manufacturer detection | ✅ | `-M` flag needed |
-| WPS Scan integration | ✅ | Separate `wash` tool |
+| Función | N2-NG | aircrack-ng puro |
+|---------|-------|------------------|
+| Interfaz de una sola ventana | ✅ | ❌ (3+ terminales) |
+| Botones legibles ("Deauth", no `-0`) | ✅ | ❌ |
+| Escaneo con channel hopping en vivo | ✅ | Flags `-C` manuales |
+| Detección automática de handshake | ✅ | Revisar a ojo en Wireshark |
+| Puerta de verificación de handshake (messagepair: AUTHORIZED vs solo challenge) | ✅ (v1.1) | ❌ |
+| Extracción automática de hashes .22000 (captura/fix/merge/lazy) | ✅ (v1.1) | Ejecuciones manuales de `hcxpcapngtool` |
+| BSSID/PWR/Beacons/#Data/CH/MB/ENC/CIPHER/AUTH/ESSID en tiempo real | ✅ | Salida de `airodump-ng` |
+| Columnas ordenables (PWR, Beacons, #Data) | ✅ | ❌ |
+| Menú contextual con clic derecho (merge/fix de capturas) | ✅ | `mergecap` manual |
+| Exportación .cap / .pcap / .22000 | ✅ | Herramientas separadas |
+| Formatos de salida configurables (csv, pcap, kismet) | ✅ | Solo prefijo `-w` |
+| Detección de fabricante | ✅ | Requiere el flag `-M` |
+| Integración de WPS Scan | ✅ | Herramienta `wash` separada |
 
 ---
 
-## Quick Start
+## Inicio Rápido
 
 ```bash
-# Clone & install
+# Clonar e instalar
 git clone https://github.com/KiMiGuel/n2-ng.git
 cd n2-ng
 sudo ./install.sh
 
-# Launch
+# Lanzar
 n2-ng
 ```
 
 ---
 
-## Dependencies
+## Dependencias
 
-**Required:**
-- Kali Linux or Debian-based distro
+**Requeridas:**
+- Kali Linux o una distro basada en Debian
 - Python 3.10+
 - `python3-tk`
 - `aircrack-ng`
 - `wireless-tools`
 - `scapy`
 
-**Optional (recommended):**
-- `hcxtools` — hashcat conversion support
-- `reaver` — WPS PIN attacks
-- `wireshark-common` — pcap analysis
-- `pcapfix` — corrupted capture repair
+**Opcionales (recomendadas):**
+- `hcxtools` — soporte de conversión para hashcat
+- `reaver` — ataques WPS PIN
+- `wireshark-common` — análisis de pcap
+- `pcapfix` — reparación de capturas corruptas
 
-All optional deps are checked at runtime — the tool warns you if something's missing instead of crashing.
-
----
-
-## Documentation
-
-- [Install Guide](docs/INSTALL.md) — detailed installation & troubleshooting
-- [User Guide](docs/USER_GUIDE.md) — full feature walkthrough
-- [Features](docs/FEATURES.md) — v1.1 feature list & comparison vs raw aircrack-ng/hcxtools
+Todas las dependencias opcionales se comprueban en tiempo de ejecución — la herramienta te avisa si falta algo en lugar de fallar.
 
 ---
 
-## Why N2-NG Over...
+## Documentación
 
-**Wifite?** Wifite automates everything including cracking. N2-NG gives you full manual control with a GUI — pick your target, choose your attack, export clean captures. It's the difference between a scalpel and a sledgehammer.
-
-**Fern WiFi Cracker?** Fern is bloated, outdated, and tries to do too much. N2-NG does one thing well: capture. No built-in dictionary attacks, no fluff. Just clean handshakes and PMKIDs.
-
-**Raw aircrack-ng?** If you enjoy juggling `airmon-ng`, `airodump-ng`, `aireplay-ng`, `wash`, and `mergecap` across four terminals while praying you didn't typo the BSSID — keep doing you. Everyone else, there's N2-NG.
+- [Guía de Instalación](docs/INSTALL.md) — instalación detallada y solución de problemas
+- [Guía de Usuario](docs/USER_GUIDE.md) — recorrido completo por las funciones
+- [Funciones](docs/FEATURES.md) — lista de funciones de v1.1 y comparación contra aircrack-ng/hcxtools puros
 
 ---
 
-## Contributing
+## ¿Por Qué N2-NG y No...?
 
-Found a bug? Got an idea? See [CONTRIBUTING.md](CONTRIBUTING.md).
+**¿Wifite?** Wifite lo automatiza todo, incluido el cracking. N2-NG te da control manual total con una GUI — elige tu objetivo, elige tu ataque, exporta capturas limpias. Es la diferencia entre un bisturí y un mazo.
 
-Security concerns? See [SECURITY.md](SECURITY.md).
+**¿Fern WiFi Cracker?** Fern es pesado, está desactualizado e intenta hacer demasiado. N2-NG hace una cosa bien: capturar. Sin ataques de diccionario integrados, sin relleno. Solo handshakes y PMKIDs limpios.
+
+**¿aircrack-ng puro?** Si disfrutas haciendo malabares con `airmon-ng`, `airodump-ng`, `aireplay-ng`, `wash` y `mergecap` en cuatro terminales mientras rezas por no haber escrito mal el BSSID — adelante, sigue así. Para todos los demás, está N2-NG.
 
 ---
 
-## License
+## Contribuir
 
-GPL-3.0. See [LICENSE](LICENSE).
+¿Encontraste un bug? ¿Tienes una idea? Consulta [CONTRIBUTING.md](CONTRIBUTING.md).
+
+¿Temas de seguridad? Consulta [SECURITY.md](SECURITY.md).
+
+---
+
+## Licencia
+
+GPL-3.0. Consulta [LICENSE](LICENSE).
 
 ---
 
 <p align="center">
-  <sub>By <b>KiMiGuEL</b> — <a href="https://github.com/KiMiGuel">INDEPENTEST</a></sub>
+  <sub>Por <b>KiMiGuEL</b> — <a href="https://github.com/KiMiGuel">INDEPENTEST</a></sub>
 </p>

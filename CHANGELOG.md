@@ -2,27 +2,27 @@
 
 ## 1.1.0
 
-### Added
-- Handshake verification gate: .22000 files are classified by the EAPOL MESSAGEPAIR byte — AUTHORIZED (messagepair 1-5, AP accepted the client's proof, crackable) vs CHALLENGE (M1+M2 only, messagepair 0, possibly a failed/wrong-password auth)
-- Verdict badge in the Capture Sessions action bar showing the selected session's verdict (AUTHORIZED / CHALLENGE / PMKID / NO PAIR), cached per path+mtime
-- Automatic .22000 generation: captures are (re)converted in the background after the capture gate, Fix Capture, Merge, and lazily when a session without a .22000 is selected
+### Añadido
+- Puerta de verificación de handshake: los archivos .22000 se clasifican por el byte MESSAGEPAIR de EAPOL — AUTHORIZED (messagepair 1-5, el AP aceptó la prueba del cliente, crackeable) vs CHALLENGE (solo M1+M2, messagepair 0, posiblemente una autenticación fallida por contraseña incorrecta)
+- Insignia de veredicto en la barra de acciones de Capture Sessions que muestra el veredicto de la sesión seleccionada (AUTHORIZED / CHALLENGE / PMKID / NO PAIR), cacheada por ruta+mtime
+- Generación automática de .22000: las capturas se (re)convierten en segundo plano tras la puerta de captura, Fix Capture, Merge, y de forma perezosa (lazy) cuando se selecciona una sesión sin .22000
 
-### Changed
-- Auto-deauth loop no longer stops on unverified handshakes (CHALLENGE only logs a warning and keeps capturing)
-- Two-level network table sorting: PWR ties break by CH ascending, CH ties break by PWR descending
+### Cambiado
+- El bucle de auto-deauth ya no se detiene con handshakes no verificados (CHALLENGE solo registra una advertencia y sigue capturando)
+- Ordenación de la tabla de redes en dos niveles: los empates de PWR se resuelven por CH ascendente, los empates de CH se resuelven por PWR descendente
 
-### Removed
-- "Convert to 22000" button and context-menu entry — conversion is now automatic
+### Eliminado
+- Botón "Convert to 22000" y su entrada de menú contextual — la conversión ahora es automática
 
 ## 1.0.0
 
-### Added
-- Randomize MAC address before entering monitor mode (#4)
-- Restore managed mode on quit while keeping pre-existing monitor interfaces (#7)
-- Archive merge sources after verified merge (opt-in) (#8)
+### Añadido
+- Aleatorización de la dirección MAC antes de entrar en monitor mode (#4)
+- Restauración de managed mode al salir, conservando las interfaces en monitor mode preexistentes (#7)
+- Archivado de las fuentes de un merge tras un merge verificado (opcional) (#8)
 
-### Fixed
-- Stop Attack now kills entire attack process groups instead of orphaning processes (#5)
-- Resolve source MAC from sysfs for WEP attacks ("cannot determine our mac address") (#3)
-- Enable mouse wheel scrolling in side dialogs (#9)
-- UI fits small displays down to 800x480 (#6)
+### Corregido
+- Stop Attack ahora mata todo el grupo de procesos del ataque en lugar de dejar procesos huérfanos (#5)
+- Resolución de la MAC de origen desde sysfs para los ataques WEP ("cannot determine our mac address") (#3)
+- Scroll con la rueda del ratón en los diálogos laterales (#9)
+- La UI cabe en pantallas pequeñas de hasta 800x480 (#6)

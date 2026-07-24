@@ -1,49 +1,49 @@
-# Contributing to N2-NG
+# Contribuir a N2-NG
 
-Thanks for taking the time to contribute! This project is built by pentesters, for pentesters — your input matters.
+¡Gracias por dedicar tiempo a contribuir! Este proyecto está hecho por pentesters, para pentesters — tu aporte importa.
 
-## How to Contribute
+## Cómo Contribuir
 
-### Reporting Bugs
+### Reportar Bugs
 
-Open an issue with:
-- Your Kali / Debian version (`lsb_release -a`)
-- Python version (`python3 --version`)
-- Wireless adapter chipset (`lsusb` or `iw dev`)
-- What you expected vs. what happened
-- Steps to reproduce
-- Screenshot if it's a GUI issue
+Abre un issue con:
+- Tu versión de Kali / Debian (`lsb_release -a`)
+- Versión de Python (`python3 --version`)
+- Chipset del adaptador inalámbrico (`lsusb` o `iw dev`)
+- Qué esperabas vs. qué ocurrió
+- Pasos para reproducir
+- Captura de pantalla si es un problema de la GUI
 
-### Feature Requests
+### Solicitar Funciones
 
-Open an issue with the `enhancement` label. Describe:
-- What the feature should do
-- Why it helps (save clicks? prevent mistakes?)
-- Mockup or description of expected UI flow
+Abre un issue con la etiqueta `enhancement`. Describe:
+- Qué debería hacer la función
+- Por qué ayuda (¿ahorra clics? ¿evita errores?)
+- Boceto o descripción del flujo de UI esperado
 
 ### Pull Requests
 
-1. Fork the repo and create a branch: `git checkout -b feature/your-thing`
-2. Make your changes
-3. Run tests: `python3 -m pytest test_helpers.py test_ui.py -v`
-4. Make sure your code follows PEP 8 (run `flake8 src/`)
-5. Submit the PR with a clear description
+1. Haz fork del repo y crea una rama: `git checkout -b feature/your-thing`
+2. Haz tus cambios
+3. Ejecuta los tests: `python3 -m pytest test_helpers.py test_ui.py -v`
+4. Asegúrate de que tu código sigue PEP 8 (ejecuta `flake8 src/`)
+5. Envía el PR con una descripción clara
 
-### Code Style
+### Estilo de Código
 
-- Follow PEP 8
-- Use type hints for new functions
-- Keep tkinter logic in `main.py`, business logic in `capture.py`/`scanner.py`/`utils.py`
-- Add docstrings for public functions
+- Sigue PEP 8
+- Usa type hints en las funciones nuevas
+- Mantén la lógica de tkinter en `main.py`, la lógica de negocio en `capture.py`/`scanner.py`/`utils.py`
+- Añade docstrings a las funciones públicas
 
-### Commit Messages
+### Mensajes de Commit
 
-Keep them descriptive:
+Mantenlos descriptivos:
 - `feat: add WPA3 detection in scan table`
 - `fix: resolve channel hop freeze on RTL8812AU`
 - `docs: update install steps for ARM64`
 
-## Development Setup
+## Entorno de Desarrollo
 
 ```bash
 git clone https://github.com/KiMiGuel/n2-ng.git
@@ -54,6 +54,6 @@ pip install -e ".[dev]"
 python3 n2_ng.py
 ```
 
-## Questions?
+## ¿Preguntas?
 
-Drop an issue or reach out. We're friendly.
+Abre un issue o ponte en contacto. Somos amigables.

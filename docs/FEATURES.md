@@ -1,158 +1,85 @@
-# N2-NG Features (v1.1)
+# Funciones de N2-NG (v1.1)
 
-N2-NG is a Python 3 + Tkinter GUI for WiFi auditing on Kali Linux. It wraps the
-aircrack-ng suite (`airmon-ng`, `airodump-ng`, `aireplay-ng`) and hcxtools
-(`hcxpcapngtool`, `hcxhash2cap`) into a single window, and adds capture
-verification and automation on top.
+N2-NG es una GUI en Python 3 + Tkinter para auditoría WiFi en Kali Linux. Envuelve la suite aircrack-ng (`airmon-ng`, `airodump-ng`, `aireplay-ng`) y hcxtools (`hcxpcapngtool`, `hcxhash2cap`) en una sola ventana, y añade verificación de capturas y automatización encima.
 
-## Feature list
+## Lista de funciones
 
-### Scanning and monitor mode
+### Escaneo y monitor mode
 
-- One-click monitor mode via `airmon-ng` (uses the interface directly if it is
-  already in monitor mode).
-- Live channel-hopping scan on 2.4 GHz, 5 GHz, or both bands via `airodump-ng`.
-- Sortable network table: BSSID, PWR, Beacons, #Data, CH, MB, ENC, CIPHER,
-  AUTH, manufacturer, ESSID. Column visibility is configurable.
-- Manufacturer (OUI) detection with `airodump-ng -M`.
-- Encryption filter (All / WEP / WPA-WPA2 / WPA3 / Open).
-- Raw View tab with the live `airodump-ng` terminal output, ANSI colors
-  included.
-- Channel lock: selecting a target locks the adapter to its channel and keeps
-  the system channel aligned so `aireplay-ng` does not complain about
-  mismatches. Manual unlock, or automatic unlock after a successful capture.
-- MAC randomization before entering monitor mode (optional, on by default per
-  settings).
-- Managed-mode restore on quit: interfaces N2-NG put into monitor mode are
-  returned to managed mode when the app closes; pre-existing monitor
-  interfaces are left alone.
+- Monitor mode con un clic mediante `airmon-ng` (usa la interfaz directamente si ya está en monitor mode).
+- Escaneo en vivo con channel hopping en 2.4 GHz, 5 GHz o ambas bandas mediante `airodump-ng`.
+- Tabla de redes ordenable: BSSID, PWR, Beacons, #Data, CH, MB, ENC, CIPHER, AUTH, fabricante, ESSID. La visibilidad de columnas es configurable.
+- Detección de fabricante (OUI) con `airodump-ng -M`.
+- Filtro por cifrado (All / WEP / WPA-WPA2 / WPA3 / Open).
+- Pestaña Raw View con la salida de terminal de `airodump-ng` en vivo, colores ANSI incluidos.
+- Bloqueo de canal: al seleccionar un objetivo, el adaptador se fija en su canal y mantiene el canal del sistema alineado para que `aireplay-ng` no se queje de mismatches. Desbloqueo manual, o desbloqueo automático tras una captura exitosa.
+- Aleatorización de MAC antes de entrar en monitor mode (opcional, activada por defecto en los ajustes).
+- Restauración de managed mode al salir: las interfaces que N2-NG puso en monitor mode vuelven a managed mode al cerrar la aplicación; las interfaces en monitor mode preexistentes se dejan intactas.
 
-### WPA handshake capture with verification gate (new in v1.1)
+### Captura de handshake WPA con puerta de verificación (nuevo en v1.1)
 
-- Deauthentication attacks (all clients or a specific client) via
-  `aireplay-ng -0`.
-- Auto-deauth loop: fires a deauth burst every 10/30/60 s until a *verified*
-  handshake or a PMKID is captured, then stops on its own.
-- The capture is continuously converted to hashcat 22000 format in the
-  background while capturing, and every WPA\*02 (EAPOL) record is classified
-  by its MESSAGEPAIR byte (low 3 bits; flag bits such as
-  nonce-error-correction `0x80` are masked off):
-  - **AUTHORIZED** (messagepair 1–5): the AP accepted the client's proof, so
-    the client knew the correct PSK. The handshake is crackable. This is the
-    only EAPOL verdict that stops the auto-deauth loop.
-  - **CHALLENGE** (messagepair 0, M1+M2 only): the AP's M1 and the client's
-    M2 were captured, but the AP never confirmed the client. This commonly
-    happens when a client authenticates with a *wrong password* — the
-    resulting MIC is computed from the wrong PSK and can never be cracked.
-    Treating it as "handshake captured" is a classic false positive of the
-    raw aircrack-ng workflow. N2-NG logs a warning
-    ("Handshake UNVERIFIED … keep capturing") and keeps deauthing.
-  - **PMKID**: WPA\*01 records are always valid attack material (no client
-    interaction needed at capture time), so they stop the loop as before.
-- Verdict badge in the Capture Sessions action bar shows the selected
-  session's verdict: AUTHORIZED (green), CHALLENGE (orange), PMKID (green),
-  NO PAIR (grey/red), or "—" when no .22000 exists yet. Verdicts are cached
-  per file path + mtime and recomputed whenever the .22000 is regenerated.
+- Ataques de deauthentication (todos los clientes o un cliente específico) mediante `aireplay-ng -0`.
+- Bucle de auto-deauth: lanza una ráfaga de deauth cada 10/30/60 s hasta capturar un handshake *verificado* o un PMKID, y luego se detiene solo.
+- La captura se convierte continuamente al formato 22000 de hashcat en segundo plano mientras se captura, y cada registro WPA\*02 (EAPOL) se clasifica por su byte MESSAGEPAIR (los 3 bits bajos; los bits de flags como nonce-error-correction `0x80` se enmascaran):
+  - **AUTHORIZED** (messagepair 1–5): el AP aceptó la prueba del cliente, así que el cliente conocía el PSK correcto. El handshake es crackeable. Es el único veredicto EAPOL que detiene el bucle de auto-deauth.
+  - **CHALLENGE** (messagepair 0, solo M1+M2): se capturaron el M1 del AP y el M2 del cliente, pero el AP nunca confirmó al cliente. Esto ocurre típicamente cuando un cliente se autentica con una *contraseña incorrecta* — el MIC resultante se calcula con el PSK equivocado y jamás podrá crackearse. Tratarlo como "handshake capturado" es un falso positivo clásico del flujo de trabajo con aircrack-ng puro. N2-NG registra una advertencia ("Handshake UNVERIFIED … keep capturing") y sigue con el deauth.
+  - **PMKID**: los registros WPA\*01 siempre son material de ataque válido (no hace falta interacción con el cliente en el momento de la captura), así que detienen el bucle como antes.
+- La insignia de veredicto (verdict badge) en la barra de acciones de Capture Sessions muestra el veredicto de la sesión seleccionada: AUTHORIZED (verde), CHALLENGE (naranja), PMKID (verde), NO PAIR (gris/rojo) o "—" cuando aún no existe .22000. Los veredictos se cachean por ruta de archivo + mtime y se recalculan cada vez que se regenera el .22000.
 
-### Automatic .22000 pipeline (new in v1.1)
+### Pipeline automático de .22000 (nuevo en v1.1)
 
-- A current hashcat .22000 file is produced automatically; the manual
-  "Convert to 22000" button was removed. Conversion happens:
-  - continuously during capture (the gate above),
-  - after **Fix Capture** succeeds,
-  - after **Merge** succeeds,
-  - lazily when a capture session without a .22000 is selected
-    (background thread, once per file, never blocks the UI).
-- Conversion uses `hcxpcapngtool` and validates that the output actually
-  contains PMKID/EAPOL records.
+- Siempre se genera automáticamente un archivo .22000 actualizado para hashcat; el botón manual "Convert to 22000" fue eliminado. La conversión ocurre:
+  - continuamente durante la captura (la puerta de verificación anterior),
+  - después de que **Fix Capture** termine con éxito,
+  - después de que **Merge** termine con éxito,
+  - de forma perezosa (lazy) cuando se selecciona una sesión de captura sin .22000 (hilo en segundo plano, una vez por archivo, nunca bloquea la UI).
+- La conversión usa `hcxpcapngtool` y valida que la salida realmente contenga registros PMKID/EAPOL.
 
-### Capture session management
+### Gestión de sesiones de captura
 
-- Sessions list of all captures and hashes under `~/hs/n2-ng/`, auto-refreshed
-  every 20 s.
-- Inspect: file metadata, hashcat record counts and types, related .22000.
-- Fix Capture: repair damaged captures with `pcapfix`.
-- Merge: combine 2+ captures with `mergecap`; the merged output is verified
-  to still contain WPA records, and the originals can optionally be archived
-  to `~/hs/n2-ng/.archive/<date>/` after a successful merge.
-- Normalize to PCAPNG with `editcap`.
-- Reconstruct a synthetic .cap from a .22000 hash file with `hcxhash2cap`
-  (with an explicit warning that it is not the original capture).
-- Copy hashcat command or raw .22000 content to the clipboard.
-- Right-click context menu with all of the above.
+- Lista de sesiones con todas las capturas y hashes bajo `~/hs/n2-ng/`, actualizada automáticamente cada 20 s.
+- Inspect: metadatos del archivo, conteo y tipos de registros hashcat, .22000 relacionado.
+- Fix Capture: repara capturas dañadas con `pcapfix`.
+- Merge: combina 2+ capturas con `mergecap`; la salida fusionada se verifica para confirmar que sigue conteniendo registros WPA, y los originales pueden archivarse opcionalmente en `~/hs/n2-ng/.archive/<fecha>/` tras un merge exitoso.
+- Normalización a PCAPNG con `editcap`.
+- Reconstrucción de un .cap sintético a partir de un archivo de hashes .22000 con `hcxhash2cap` (con una advertencia explícita de que no es la captura original).
+- Copiar al portapapeles el comando de hashcat o el contenido del .22000.
+- Menú contextual con clic derecho con todo lo anterior.
 
-### Attacks
+### Ataques
 
-- Deauthenticate All Clients / Specific Client (`aireplay-ng -0`).
-- Auto-deauth loop (see above).
-- WPS scan (`wash`, falling back to `reaver --scan`) with a live output
-  dialog.
-- Reaver WPS PIN attack against the locked target.
-- Legacy WEP attacks (behind a "Show Legacy WEP Attacks" toggle): fake
-  authentication, ARP replay, chopchop, fragmentation. Source MAC is resolved
-  from sysfs so these work with randomized MACs.
-- Stop Attack kills the entire attack process group — no orphaned
-  `aireplay-ng`/`reaver` processes.
+- Deauthenticate All Clients / Deauthenticate Specific Client (`aireplay-ng -0`).
+- Bucle de auto-deauth (ver arriba).
+- WPS scan (`wash`, con `reaver --scan` como respaldo) con un diálogo de salida en vivo.
+- Ataque Reaver WPS PIN contra el objetivo bloqueado.
+- Ataques WEP legacy (tras el conmutador "Show Legacy WEP Attacks"): fake authentication, ARP replay, chopchop, fragmentation. La MAC de origen se resuelve desde sysfs para que funcionen con MACs aleatorizadas.
+- Stop Attack mata todo el grupo de procesos del ataque — no quedan procesos `aireplay-ng`/`reaver` huérfanos.
 
-### Hashcat integration
+### Integración con hashcat
 
-- Hashcat dialog for any session with a valid .22000: dictionary attack
-  (`-m 22000 -a 0`) with wordlist picker, live command preview, streaming
-  output, Start/Stop, and a named session (`n2ng-<timestamp>`) so runs can be
-  resumed with `hashcat --session n2ng-<timestamp> --restore`.
+- Diálogo de hashcat para cualquier sesión con un .22000 válido: ataque de diccionario (`-m 22000 -a 0`) con selector de wordlist, vista previa del comando en vivo, salida en streaming, Start/Stop, y una sesión con nombre (`n2ng-<timestamp>`) para poder reanudar las ejecuciones con `hashcat --session n2ng-<timestamp> --restore`.
 
-### UI / quality of life
+### UI / calidad de vida
 
-- Two-level table sorting (new in v1.1): sorting by PWR breaks ties by
-  channel ascending; sorting by CH breaks ties by power descending. All other
-  columns keep single-key behavior.
-- Click column headers to sort; click again to reverse direction.
-- Small-screen support down to 800x480 (window and dialogs clamp to the
-  screen, right panel scrolls).
-- Dark terminal-style theme, monospace scan table, signal-strength graph for
-  the locked target.
-- Dependency checking at startup and per feature: missing optional tools
-  (hcxtools, reaver, mergecap, editcap, pcapfix, hashcat, tshark) produce a
-  warning with the `apt` install command instead of a crash.
-- Settings persist per user (including the invoking user when run via sudo).
+- Ordenación de tabla en dos niveles (nuevo en v1.1): al ordenar por PWR, los empates se resuelven por canal ascendente; al ordenar por CH, los empates se resuelven por potencia descendente. Las demás columnas conservan el comportamiento de clave única.
+- Clic en las cabeceras de columna para ordenar; clic de nuevo para invertir la dirección.
+- Soporte para pantallas pequeñas de hasta 800x480 (la ventana y los diálogos se ajustan a la pantalla, el panel derecho tiene scroll).
+- Tema oscuro estilo terminal, tabla de escaneo monoespaciada, gráfica de intensidad de señal para el objetivo bloqueado.
+- Comprobación de dependencias al inicio y por función: las herramientas opcionales que falten (hcxtools, reaver, mergecap, editcap, pcapfix, hashcat, tshark) producen una advertencia con el comando `apt` de instalación en lugar de un fallo.
+- Los ajustes se guardan por usuario (incluido el usuario que invocó el comando cuando se ejecuta vía sudo).
 
-## Compared to the manual tooling
+## Comparación con las herramientas manuales
 
-### vs. the raw aircrack-ng workflow (airmon-ng + airodump-ng + aireplay-ng + aircrack-ng)
+### vs. el flujo de trabajo con aircrack-ng puro (airmon-ng + airodump-ng + aireplay-ng + aircrack-ng)
 
-The classic workflow needs at least three terminals: one running
-`airodump-ng` locked on a channel, one firing `aireplay-ng -0` bursts, and
-one to check the capture — where "is the handshake good?" usually means
-re-reading airodump's `WPA handshake` note, opening the capture in Wireshark,
-or running `aircrack-ng`/`cowpatty` against it. That note appears for *any*
-M1+M2 pair, including pairs from clients that used the wrong password, which
-are uncrackable.
+El flujo clásico necesita al menos tres terminales: una con `airodump-ng` fijado en un canal, una lanzando ráfagas de `aireplay-ng -0`, y una para revisar la captura — donde "¿el handshake es bueno?" normalmente significa releer la nota `WPA handshake` de airodump, abrir la captura en Wireshark, o ejecutar `aircrack-ng`/`cowpatty` contra ella. Esa nota aparece con *cualquier* par M1+M2, incluidos los pares de clientes que usaron una contraseña incorrecta, que son imposibles de crackear.
 
-N2-NG automates the whole loop in one window: monitor mode, channel locking,
-deauth bursts, and — since v1.1 — *verification* of what was captured by
-parsing the messagepair byte of every EAPOL record, so the auto-deauth loop
-only stops on material that can actually be cracked. Captures are converted
-to hashcat format automatically instead of by hand.
+N2-NG automatiza todo el bucle en una ventana: monitor mode, bloqueo de canal, ráfagas de deauth y — desde v1.1 — la *verificación* de lo capturado analizando el byte messagepair de cada registro EAPOL, de modo que el bucle de auto-deauth solo se detiene con material que realmente se puede crackear. Las capturas se convierten al formato de hashcat automáticamente en lugar de hacerlo a mano.
 
-What it does **not** replace: the fine-grained control of the individual
-tools. There is no way to craft custom `aireplay-ng` invocations, tweak
-`airodump-ng` beyond the exposed settings, or run `aircrack-ng` itself for
-WEP cracking — the legacy WEP attacks are convenience wrappers, not a full
-WEP toolkit.
+Lo que **no** reemplaza: el control fino de las herramientas individuales. No hay forma de crear invocaciones personalizadas de `aireplay-ng`, ajustar `airodump-ng` más allá de los ajustes expuestos, ni ejecutar `aircrack-ng` directamente para crackeo WEP — los ataques WEP legacy son envoltorios de conveniencia, no un kit WEP completo.
 
 ### vs. hcxtools (hcxdumptool + hcxpcapngtool)
 
-`hcxdumptool` is a dedicated attack/capture engine: it does AP-less PMKID
-attacks, active EAPOL probing, and beacon-less interaction that
-`airodump-ng` + `aireplay-ng` simply do not do. N2-NG does **not** replace
-hcxdumptool — its capture engine is still `airodump-ng`, and PMKIDs are only
-collected passively when an AP offers them.
+`hcxdumptool` es un motor de ataque/captura dedicado: hace ataques PMKID sin AP (AP-less), sondeo EAPOL activo e interacción sin beacons que `airodump-ng` + `aireplay-ng` simplemente no hacen. N2-NG **no** reemplaza a hcxdumptool — su motor de captura sigue siendo `airodump-ng`, y los PMKID solo se recolectan pasivamente cuando un AP los ofrece.
 
-What N2-NG adds on the hcxtools side is the post-processing automation: every
-capture is run through `hcxpcapngtool` automatically (during capture, after
-fix, after merge, and on selection), the output is validated, and the
-messagepair-based verdict tells you whether the extracted hash is worth
-feeding to hashcat before you spend GPU time on it. If you want hcxdumptool's
-active attack modes, run hcxdumptool and import the resulting pcapng into
-N2-NG's session list — the .22000 pipeline and verdict badge work on those
-files too.
+Lo que N2-NG añade del lado de hcxtools es la automatización del post-procesado: cada captura pasa por `hcxpcapngtool` automáticamente (durante la captura, tras fix, tras merge y al seleccionar), la salida se valida, y el veredicto basado en messagepair te dice si el hash extraído vale la pena antes de gastar tiempo de GPU en él. Si quieres los modos de ataque activos de hcxdumptool, ejecútalo e importa el pcapng resultante en la lista de sesiones de N2-NG — el pipeline de .22000 y la insignia de veredicto también funcionan con esos archivos.
