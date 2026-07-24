@@ -872,6 +872,7 @@ class Settings:
         "quiet_mode": False,
         "auto_unlock_after_capture": False,
         "mac_randomization": True,
+        "merge_archive_originals": False,
         "col_visibility": {
             "pwr": True,
             "beacons": True,
@@ -1954,6 +1955,10 @@ class SettingsDialog(tk.Toplevel):
         self.mac_rand_var = tk.BooleanVar(value=self.settings.get("mac_randomization"))
         tk.Checkbutton(frame, text="Randomize MAC before monitor mode", variable=self.mac_rand_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=10, column=0, sticky=tk.W, columnspan=2)
 
+        # Archive originals after merge
+        self.merge_archive_var = tk.BooleanVar(value=self.settings.get("merge_archive_originals"))
+        tk.Checkbutton(frame, text="Archive originals after successful merge", variable=self.merge_archive_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=11, column=0, sticky=tk.W, columnspan=2)
+
         # Buttons
         btn_frame = tk.Frame(self, bg=THEME["bg"])
         btn_frame.pack(pady=10)
@@ -1975,6 +1980,7 @@ class SettingsDialog(tk.Toplevel):
             "output_formats": formats,
             "auto_unlock_after_capture": self.auto_unlock_var.get(),
             "mac_randomization": self.mac_rand_var.get(),
+            "merge_archive_originals": self.merge_archive_var.get(),
         }
         ok, error = self.apply_callback(proposed, self.pause_var.get())
         if ok:
@@ -3561,10 +3567,56 @@ class N2NgApp:
         if result.ok and result.output:
             messagebox.showinfo("N2-ng", f"Merged capture saved to:\n{result.output}")
             self._log(f"Merged {len(caps)} captures -> {result.output.name}")
+            if self.settings.get("merge_archive_originals"):
+                self._archive_merge_sources(caps, result)
             self._complete_history_operation(result)
         else:
             self._complete_history_operation(result)
             messagebox.showwarning("N2-ng", self._process_result_details(result))
+
+    def _archive_merge_sources(self, caps: list[Path], result: CaptureProcessResult):
+        """Move merge sources to <capture_root>/.archive/YYYY-MM-DD/ after a verified merge."""
+        output = result.output
+        if result.returncode != 0 or not output or not output.exists() or output.stat().st_size == 0:
+            self._log(f"Merge output failed verification; sources left untouched: {[c.name for c in caps]}")
+            return
+        if not self._verify_merged_capture(caps, output):
+            self._log("Warning: hcxpcapngtool found no WPA records in the merged output; sources left untouched.")
+            return
+        archive_dir = capture_root() / ".archive" / time.strftime("%Y-%m-%d")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for cap in caps:
+            if not cap.exists():
+                continue
+            dest = unique_path(archive_dir / cap.name)
+            try:
+                shutil.move(str(cap), str(dest))
+                self._log(f"Archived {cap.name} -> {dest}")
+            except OSError as e:
+                self._log(f"Warning: could not archive {cap.name}: {e}")
+
+    def _verify_merged_capture(self, caps: list[Path], output: Path) -> bool:
+        """Sanity-check the merged output with hcxpcapngtool when sources contained WPA records."""
+        hcx = DependencyChecker.resolve_tool("hcxpcapngtool")
+        if not hcx.installed:
+            return True
+        source_records = sum(self._hcx_wpa_records(cap, hcx.path) for cap in caps)
+        if source_records == 0:
+            return True
+        return self._hcx_wpa_records(output, hcx.path) > 0
+
+    def _hcx_wpa_records(self, cap: Path, hcx_path: str) -> int:
+        """Return the number of WPA records hcxpcapngtool extracts from cap, 0 on failure."""
+        tmp = cap.with_suffix(".tmp22000")
+        try:
+            rc = subprocess.run([hcx_path, "-o", str(tmp), str(cap)], capture_output=True, text=True, timeout=120)
+            if rc.returncode == 0 and tmp.exists():
+                return hashcat_22000_info(tmp)["records"]
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            tmp.unlink(missing_ok=True)
+        return 0
 
     def _update_clients(self, clients: list[dict]):
         self.clients = clients
