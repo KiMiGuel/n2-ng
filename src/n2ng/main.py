@@ -8,6 +8,7 @@ import argparse
 import os
 import platform
 import queue
+import random
 import re
 import shutil
 import shlex
@@ -27,7 +28,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 try:
     from . import __version__
 except ImportError:
-    __version__ = "0.1.3"
+    __version__ = "1.1.0"
 
 
 THEME = {
@@ -223,6 +224,11 @@ def human_size(size: int) -> str:
     return f"{size:.1f} GB"
 
 
+def clamp_to_screen(width: int, height: int, scr_w: int, scr_h: int, margin_w: int = 0, margin_h: int = 0) -> tuple[int, int]:
+    """Clamp a window size so it fits on small displays (e.g. 800x480)."""
+    return (min(width, max(1, scr_w - margin_w)), min(height, max(1, scr_h - margin_h)))
+
+
 def user_home() -> Path:
     """Return the original user's home directory even when running under sudo."""
     sudo_user = os.environ.get("SUDO_USER")
@@ -314,6 +320,52 @@ def hashcat_22000_info(path: Path) -> dict:
 
 def is_hashcat_22000_file(path: Path) -> bool:
     return path.suffix.lower() == ".22000"
+
+
+# Verdicts returned by classify_22000_text / classify_22000.
+VERDICT_AUTHORIZED = "AUTHORIZED"
+VERDICT_CHALLENGE = "CHALLENGE"
+VERDICT_PMKID = "PMKID"
+VERDICT_NONE = "NONE"
+
+
+def classify_22000_text(text: str) -> str:
+    """Classify hc22000 content by handshake verifiability.
+
+    The MESSAGEPAIR byte (last *-separated field of a WPA*02 line) identifies
+    the captured EAPOL message pair in its low 3 bits: 0 = M1+M2 "challenge"
+    (UNVERIFIED, may come from a failed/wrong-password auth), 1-5 = pairs
+    where the AP accepted the client's proof ("authorized").  Upper bits are
+    flags (e.g. 0x80 = nonce-error-correction) and are masked off with & 0x07.
+    WPA*01 lines are PMKIDs, which are always valid attack material.
+    """
+    saw_eapol = False
+    saw_pmkid = False
+    for line in text.splitlines():
+        if line.startswith("WPA*01*"):
+            saw_pmkid = True
+        elif line.startswith("WPA*02*"):
+            saw_eapol = True
+            try:
+                messagepair = int(line.rsplit("*", 1)[-1], 16) & 0x07
+            except ValueError:
+                continue
+            if messagepair in (1, 2, 3, 4, 5):
+                return VERDICT_AUTHORIZED
+    if saw_eapol:
+        return VERDICT_CHALLENGE
+    if saw_pmkid:
+        return VERDICT_PMKID
+    return VERDICT_NONE
+
+
+def classify_22000(path: Path) -> str:
+    """Classify a .22000 file: AUTHORIZED / CHALLENGE / PMKID / NONE."""
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return VERDICT_NONE
+    return classify_22000_text(text)
 
 
 def default_hashcat_wordlist() -> Path | None:
@@ -497,6 +549,35 @@ class DependencyChecker:
         return statuses
 
 
+def bind_mousewheel(widget, target):
+    """Bind mouse wheel events on `widget` and its children to scroll `target`."""
+    def _on_mousewheel(event):
+        # Windows sends +/-120 per notch; macOS sends small deltas, so fall back to sign.
+        steps = -1 * (event.delta // 120) if event.delta else 0
+        if steps == 0 and event.delta:
+            steps = -1 if event.delta > 0 else 1
+        if steps:
+            target.yview_scroll(steps, "units")
+        return "break"
+
+    def _on_button4(_event):
+        target.yview_scroll(-1, "units")
+        return "break"
+
+    def _on_button5(_event):
+        target.yview_scroll(1, "units")
+        return "break"
+
+    def _bind(w):
+        w.bind("<MouseWheel>", _on_mousewheel)
+        w.bind("<Button-4>", _on_button4)
+        w.bind("<Button-5>", _on_button5)
+        for child in w.winfo_children():
+            _bind(child)
+
+    _bind(widget)
+
+
 class DependencySplash(tk.Toplevel):
     """Startup dependency report shown before the main window."""
 
@@ -524,6 +605,7 @@ class DependencySplash(tk.Toplevel):
         self.hint.pack(anchor=tk.W, padx=12, pady=(0, 12))
         self.bind_all("<Button-1>", self._maybe_close, add="+")
         self._checks_done = False
+        bind_mousewheel(self, self.text)
 
     def run(self) -> bool:
         self.grab_set()
@@ -584,6 +666,10 @@ class AirmonManager:
     def __init__(self):
         # Maps original interface -> detected monitor interface
         self._mon_map: dict[str, str] = {}
+        # Maps interface -> permanent MAC read from sysfs before randomization
+        self._orig_macs: dict[str, str] = {}
+        # Interfaces that were already in monitor mode before n2-ng used them
+        self._preexisting: set[str] = set()
 
     @staticmethod
     def _list_interfaces() -> set[str]:
@@ -646,11 +732,50 @@ class AirmonManager:
         except Exception:
             return False
 
+    def randomize_mac(self, iface: str) -> str | None:
+        """Spoof a locally-administered random MAC, leaving the iface DOWN.
+
+        airmon-ng brings the interface up itself, and the monitor interface
+        inherits the spoofed MAC. Returns the new MAC, or None on failure.
+        """
+        try:
+            perm = Path(f"/sys/class/net/{iface}/address").read_text().strip()
+            if perm:
+                self._orig_macs[iface] = perm
+            first = (random.randrange(256) | 0x02) & 0xFE
+            new_mac = "%02x:%02x:%02x:%02x:%02x:%02x" % (
+                first,
+                *[random.randrange(256) for _ in range(5)],
+            )
+            subprocess.run(["ip", "link", "set", iface, "down"], check=True, capture_output=True)
+            subprocess.run(["ip", "link", "set", iface, "address", new_mac], check=True, capture_output=True)
+            return new_mac
+        except Exception as e:
+            print(f"warning: failed to randomize MAC on {iface}: {e}")
+            return None
+
+    def restore_mac(self, iface: str) -> str | None:
+        """Restore the stored permanent MAC (down -> set -> up), if any."""
+        perm = self._orig_macs.pop(iface, None)
+        if not perm:
+            return None
+        try:
+            subprocess.run(["ip", "link", "set", iface, "down"], check=True, capture_output=True)
+            subprocess.run(["ip", "link", "set", iface, "address", perm], check=True, capture_output=True)
+            subprocess.run(["ip", "link", "set", iface, "up"], check=True, capture_output=True)
+        except Exception as e:
+            print(f"warning: failed to restore MAC on {iface}: {e}")
+            return None
+        return perm
+
     def start_monitor(self, iface: str) -> str:
         # If the selected interface is already in monitor mode, use it directly.
         if self._is_monitor(iface):
             self._mon_map[iface] = iface
+            self._preexisting.add(iface)
             return iface
+        # We are creating the monitor ourselves; it is no longer pre-existing.
+        self._preexisting.discard(iface)
         # Stop any previous monitor for this iface
         self.stop_monitor_for_iface(iface)
         before = self._list_interfaces()
@@ -683,6 +808,9 @@ class AirmonManager:
 
     def stop_monitor_for_iface(self, iface: str) -> None:
         mon = self._mon_map.pop(iface, None)
+        if mon and mon in self._preexisting:
+            # Pre-existing monitor: never stop it
+            return
         if mon and mon != iface:
             subprocess.run(["airmon-ng", "stop", mon], capture_output=True, text=True)
         elif mon == iface:
@@ -697,12 +825,19 @@ class AirmonManager:
         subprocess.run(["airmon-ng", "stop", iface], capture_output=True, text=True)
 
     def stop_monitor(self, mon_iface: str) -> None:
-        if mon_iface:
+        if mon_iface and mon_iface not in self._preexisting:
             subprocess.run(["airmon-ng", "stop", mon_iface], capture_output=True, text=True)
 
     def cleanup(self) -> None:
         for iface in list(self._mon_map.keys()):
+            if self._mon_map.get(iface) in self._preexisting:
+                # Pre-existing monitor: leave it running, just forget it
+                self._mon_map.pop(iface, None)
+                continue
             self.stop_monitor_for_iface(iface)
+            print(f"Adapter restored to managed mode ({iface})")
+        for iface in list(self._orig_macs.keys()):
+            self.restore_mac(iface)
 
     @staticmethod
     def _iface_exists(name: str) -> bool:
@@ -787,6 +922,8 @@ class Settings:
         "filter_encryption": "All",
         "quiet_mode": False,
         "auto_unlock_after_capture": False,
+        "mac_randomization": True,
+        "merge_archive_originals": False,
         "col_visibility": {
             "pwr": True,
             "beacons": True,
@@ -1151,6 +1288,7 @@ class AttackController:
     def __init__(self, log_func):
         self.log = log_func
         self._current = None
+        self._procs = set()
         self._lock = threading.Lock()
 
     def _run(self, cmd: list[str]):
@@ -1158,10 +1296,12 @@ class AttackController:
         proc = None
         try:
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                start_new_session=True,
             )
             with self._lock:
                 self._current = proc
+                self._procs.add(proc)
             if proc.stdout:
                 for line in proc.stdout:
                     self.log(line.rstrip())
@@ -1170,6 +1310,7 @@ class AttackController:
             self.log(f"Attack failed: {e}")
         finally:
             with self._lock:
+                self._procs.discard(proc)
                 if self._current is proc:
                     self._current = None
 
@@ -1190,6 +1331,28 @@ class AttackController:
             except Exception:
                 pass
         return True
+
+    def stop_all(self) -> int:
+        """Terminate every live attack process group; escalate to SIGKILL after a grace period."""
+        with self._lock:
+            procs = [p for p in self._procs if p.poll() is None]
+        killed = 0
+        for p in procs:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                killed += 1
+            except (ProcessLookupError, OSError):
+                pass
+        deadline = time.monotonic() + 2
+        while any(p.poll() is None for p in procs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+        return killed
 
     def deauth_all(self, bssid: str, mon_iface: str, count: int = 10):
         cmd = ["aireplay-ng", "-0", str(count), "-a", bssid, mon_iface]
@@ -1221,12 +1384,14 @@ class CaptureManager:
         self.active_cap: Path | None = None
         self.handshake_found = False
         self.pmkid_found = False
+        self.challenge_seen = False
         self._last_size = 0
 
     def set_active_cap(self, cap_path: Path):
         self.active_cap = cap_path
         self.handshake_found = False
         self.pmkid_found = False
+        self.challenge_seen = False
         self._last_size = 0
 
     def get_size(self) -> int:
@@ -1266,10 +1431,19 @@ class CaptureManager:
             tmp.unlink(missing_ok=True)
 
     def _classify(self, path: Path):
-        text = path.read_text(errors="ignore")
-        if "WPA*02" in text and not self.handshake_found:
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            return
+        verdict = classify_22000_text(text)
+        if verdict == VERDICT_AUTHORIZED and not self.handshake_found:
+            # The AP accepted the client's proof: this handshake is crackable.
             self.handshake_found = True
             self.queue.put(("handshake", {"file": str(path), "type": "handshake"}))
+        elif verdict == VERDICT_CHALLENGE and not self.challenge_seen and not self.handshake_found:
+            # M1+M2 only: possibly a failed/wrong-password auth. Keep capturing.
+            self.challenge_seen = True
+            self.queue.put(("challenge", {"file": str(path), "type": "handshake"}))
         if "WPA*01" in text and not self.pmkid_found:
             self.pmkid_found = True
             self.queue.put(("pmkid", {"file": str(path), "type": "pmkid"}))
@@ -1460,6 +1634,7 @@ class ConversionDialog(tk.Toplevel):
         buttons.pack(fill=tk.X, padx=10, pady=(0, 10))
         tk.Button(buttons, text="Convert", command=self._convert, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT)
         tk.Button(buttons, text="Cancel", command=self.destroy, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.RIGHT)
+        bind_mousewheel(self, self.status)
 
     def _preview_text(self) -> str:
         if self.mode.get() == "pcapng":
@@ -1505,7 +1680,8 @@ class HashcatDialog(tk.Toplevel):
         self.session_name = f"n2ng-{int(time.time())}"
         self.title("N2-ng Hashcat")
         self.configure(bg=THEME["panel"])
-        self.geometry("820x520")
+        dlg_w, dlg_h = clamp_to_screen(820, 520, self.winfo_screenwidth(), self.winfo_screenheight())
+        self.geometry(f"{dlg_w}x{dlg_h}")
         self.transient(parent)
 
         tk.Label(self, text="Hashcat dictionary attack", bg=THEME["panel"], fg=THEME["fg"], font=("TkDefaultFont", 12, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 4))
@@ -1532,6 +1708,7 @@ class HashcatDialog(tk.Toplevel):
         tk.Button(buttons, text="Close", command=self.destroy, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.RIGHT)
         self.wordlist_var.trace_add("write", lambda *_args: self._update_preview())
         self._update_preview()
+        bind_mousewheel(self, self.output)
 
     def _browse_wordlist(self):
         path = filedialog.askopenfilename(parent=self, title="Select wordlist")
@@ -1630,7 +1807,7 @@ class WpsScanner(threading.Thread):
         else:
             self.callback("error", "wash/reaver not found")
             return
-        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         while not self._stop.is_set():
             line = self._proc.stdout.readline()
             if not line:
@@ -1640,15 +1817,19 @@ class WpsScanner(threading.Thread):
 
     def stop(self):
         self._stop.set()
-        if self._proc:
+        if not self._proc:
+            return
+        try:
+            os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            return
+        try:
+            self._proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
             try:
-                self._proc.terminate()
-                self._proc.wait(timeout=2)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
 
 
 class AirodumpRawView:
@@ -1833,6 +2014,14 @@ class SettingsDialog(tk.Toplevel):
         self.auto_unlock_var = tk.BooleanVar(value=self.settings.get("auto_unlock_after_capture"))
         tk.Checkbutton(frame, text="Auto-unlock channel after capture", variable=self.auto_unlock_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=9, column=0, sticky=tk.W, columnspan=2)
 
+        # MAC randomization
+        self.mac_rand_var = tk.BooleanVar(value=self.settings.get("mac_randomization"))
+        tk.Checkbutton(frame, text="Randomize MAC before monitor mode", variable=self.mac_rand_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=10, column=0, sticky=tk.W, columnspan=2)
+
+        # Archive originals after merge
+        self.merge_archive_var = tk.BooleanVar(value=self.settings.get("merge_archive_originals"))
+        tk.Checkbutton(frame, text="Archive originals after successful merge", variable=self.merge_archive_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=11, column=0, sticky=tk.W, columnspan=2)
+
         # Buttons
         btn_frame = tk.Frame(self, bg=THEME["bg"])
         btn_frame.pack(pady=10)
@@ -1853,6 +2042,8 @@ class SettingsDialog(tk.Toplevel):
             "write_interval": self.interval_var.get(),
             "output_formats": formats,
             "auto_unlock_after_capture": self.auto_unlock_var.get(),
+            "mac_randomization": self.mac_rand_var.get(),
+            "merge_archive_originals": self.merge_archive_var.get(),
         }
         ok, error = self.apply_callback(proposed, self.pause_var.get())
         if ok:
@@ -1884,8 +2075,11 @@ class N2NgApp:
         self.root = root
         self.demo_mode = demo_mode
         self.root.title(f"N2-ng v{__version__}")
-        self.root.geometry("1320x760")
-        self.root.minsize(900, 560)
+        scr_w, scr_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        init_w, init_h = clamp_to_screen(1320, 760, scr_w, scr_h)
+        self.root.geometry(f"{init_w}x{init_h}")
+        min_w, min_h = clamp_to_screen(900, 560, scr_w, scr_h, margin_w=40, margin_h=60)
+        self.root.minsize(min_w, min_h)
         self.root.configure(bg=THEME["bg"])
 
         self.queue = queue.Queue()
@@ -1900,8 +2094,10 @@ class N2NgApp:
         self.clients: list[dict] = []
         self.locked_target: dict | None = None
         self.mon_iface: str | None = None
+        self._rand_iface: str | None = None
         self.current_band = tk.StringVar(value="Both")
         self.adapter_var = tk.StringVar()
+        self.mac_var = tk.StringVar(value="")
         self.poll_id = None
         self._poll_running = False
         self._capture_size_after_id = None
@@ -1913,6 +2109,8 @@ class N2NgApp:
         self._context_menu = None
         self._history_paths: dict[str, Path] = {}
         self._last_history_result = ""
+        self._verdict_cache: dict[str, tuple[float, str]] = {}
+        self._lazy_convert_attempted: set[str] = set()
         self.hashcat_dialog = None
 
         # Column visibility / sorting state for the network tree.
@@ -2069,12 +2267,12 @@ class N2NgApp:
 
         # Left: network tree
         left_frame = tk.Frame(self.content_frame, bg=THEME["bg"])
-        self.content_pane.add(left_frame, minsize=380, stretch="always")
+        self.content_pane.add(left_frame, minsize=320, stretch="always")
         self._build_network_tree(left_frame)
 
         # Right: notebook with Scan and Raw View tabs
         right_frame = tk.Frame(self.content_frame, bg=THEME["bg"])
-        self.content_pane.add(right_frame, minsize=460, stretch="always")
+        self.content_pane.add(right_frame, minsize=400, stretch="always")
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
@@ -2125,6 +2323,7 @@ class N2NgApp:
         tk.Label(toolbar, text="Adapter:", bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
         self.adapter_combo = ttk.Combobox(toolbar, textvariable=self.adapter_var, state="readonly", width=16)
         self.adapter_combo.pack(side=tk.LEFT, padx=5)
+        tk.Label(toolbar, textvariable=self.mac_var, bg=THEME["panel"], fg=THEME["info"], font=self._mono_font).pack(side=tk.LEFT)
 
         tk.Label(toolbar, text="Band:", bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
         self.band_combo = ttk.Combobox(
@@ -2281,11 +2480,13 @@ class N2NgApp:
         action_bar = tk.Frame(hist_frame, bg=THEME["panel"])
         action_bar.pack(fill=tk.X, padx=4, pady=2)
         self.inspect_btn = tk.Button(action_bar, text="Inspect", command=self._inspect_selected_capture, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
-        self.convert_btn = tk.Button(action_bar, text="Convert to 22000", command=self._convert_selected_to_22000, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
+        self.verdict_badge = tk.Label(action_bar, text="—", bg=THEME["panel"], fg=THEME["fg"], width=11, relief=tk.RIDGE, bd=1)
         self.fix_btn = tk.Button(action_bar, text="Fix Capture", command=self._fix_selected_capture, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
         self.merge_btn = tk.Button(action_bar, text="Merge", command=self._merge_selected, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
         self.hashcat_btn = tk.Button(action_bar, text="Hashcat", command=self._open_hashcat_for_selection, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
-        for button in (self.inspect_btn, self.convert_btn, self.fix_btn, self.merge_btn, self.hashcat_btn):
+        self.inspect_btn.pack(side=tk.LEFT, padx=2)
+        self.verdict_badge.pack(side=tk.LEFT, padx=4)
+        for button in (self.fix_btn, self.merge_btn, self.hashcat_btn):
             button.pack(side=tk.LEFT, padx=2)
 
         # Auto-refresh the capture-sessions history every 20 seconds.
@@ -2441,6 +2642,22 @@ class N2NgApp:
         if ifaces and not self.adapter_var.get():
             self.adapter_var.set(ifaces[0])
 
+    def _update_mac_label(self):
+        mac = ""
+        if self.mon_iface:
+            try:
+                mac = Path(f"/sys/class/net/{self.mon_iface}/address").read_text().strip()
+            except Exception:
+                mac = ""
+        self.mac_var.set(mac)
+
+    def _restore_rand_mac(self):
+        if self._rand_iface:
+            perm = self.airmon.restore_mac(self._rand_iface)
+            if perm:
+                self._log(f"MAC restored to {perm}")
+            self._rand_iface = None
+
     def _start_monitor(self):
         iface = self.adapter_var.get()
         if not iface:
@@ -2448,27 +2665,45 @@ class N2NgApp:
             return
         self._log(f"Starting monitor mode on {iface}")
         try:
+            self._rand_iface = None
+            if self.settings.get("mac_randomization") and not self.airmon._is_monitor(iface):
+                new_mac = self.airmon.randomize_mac(iface)
+                if new_mac:
+                    self._rand_iface = iface
+                    self._log(f"MAC randomized to {new_mac} on {iface}")
             self.mon_iface = self.airmon.start_monitor(iface)
             self.status.config(text=f"Monitor: {self.mon_iface}")
+            self._update_mac_label()
             ok, error = self.worker.start_scan(self.mon_iface, self.current_band.get(), scan_prefix())
             if not ok:
                 failed_iface = self.mon_iface
                 self.mon_iface = None
                 self.airmon.stop_monitor(failed_iface)
+                self._restore_rand_mac()
+                self._update_mac_label()
                 self.pause_btn.config(text="Pause Scan", state=tk.DISABLED, width=10)
                 self.status.config(text=f"Scan failed: {error}", bg="red", fg="white")
                 return
             self.pause_btn.config(text="Pause Scan", state=tk.NORMAL)
         except Exception as e:
+            self._restore_rand_mac()
             messagebox.showerror("N2-ng", f"Failed to start monitor mode: {e}")
 
     def _stop_monitor(self):
         self.worker.stop()
         self.worker.clear_latest()
+        status_text = "Monitor stopped"
         if self.mon_iface:
-            self.airmon.stop_monitor(self.mon_iface)
+            if self.mon_iface in self.airmon._preexisting:
+                # Pre-existing monitor: leave it running, just clear our state
+                self.airmon._mon_map.pop(self.mon_iface, None)
+                status_text = "Pre-existing monitor kept"
+            else:
+                self.airmon.stop_monitor(self.mon_iface)
             self.mon_iface = None
-        self.status.config(text="Monitor stopped")
+        self._restore_rand_mac()
+        self._update_mac_label()
+        self.status.config(text=status_text)
         self.channel_pill.config(text="SCANNING ALL", bg="red")
         self.pause_btn.config(text="Pause Scan", state=tk.DISABLED, width=10)
 
@@ -2511,6 +2746,7 @@ class N2NgApp:
         self.wps_scanner = WpsScanner(self.mon_iface, self._on_wps_event)
         self.wps_scanner.start()
         tk.Button(self.wps_dialog, text="Stop", command=self._stop_wps_scan, bg=THEME["panel"], fg=THEME["fg"]).pack(pady=5)
+        bind_mousewheel(self.wps_dialog, text)
 
     def _on_wps_event(self, event, payload):
         self.queue.put(("wps_line" if event == "wps_line" else "error", payload))
@@ -2908,13 +3144,22 @@ class N2NgApp:
     # Attack handlers
     # ------------------------------------------------------------------
     def _our_mac(self) -> str | None:
+        mac = None
         try:
-            out = subprocess.check_output(["ip", "link", "show", self.mon_iface], text=True, stderr=subprocess.DEVNULL)
-            m = re.search(r"link/ether\s+([0-9a-f:]{17})", out)
-            if m:
-                return m.group(1).upper()
+            with open(f"/sys/class/net/{self.mon_iface}/address") as f:
+                mac = f.read().strip()
         except Exception:
             pass
+        if mac is None:
+            try:
+                out = subprocess.check_output(["ip", "link", "show", self.mon_iface], text=True, stderr=subprocess.DEVNULL)
+                m = re.search(r"link/ether\s+([0-9a-f:]{17})", out)
+                if m:
+                    mac = m.group(1)
+            except Exception:
+                pass
+        if mac and re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac.lower()):
+            return mac.upper()
         return None
 
     def _confirm_attack(self, cmd: list[str]) -> bool:
@@ -2963,8 +3208,8 @@ class N2NgApp:
 
     def _stop_attack(self):
         self.auto_deauth_var.set(False)
-        stopped = self.attack.stop_current()
-        text = "Attack stopped" if stopped else "No attack process running"
+        stopped = self.attack.stop_all()
+        text = f"All attack processes stopped ({stopped} killed)" if stopped else "No attack process running"
         self.status.config(text=text, bg=THEME["panel"], fg=THEME["fg"])
         self._log(text)
 
@@ -3022,6 +3267,10 @@ class N2NgApp:
                     break
                 if event == "handshake":
                     self._notify_capture("WPA Handshake Captured", payload["file"])
+                elif event == "challenge":
+                    self._log(f"Handshake UNVERIFIED (M1+M2 challenge only — possible failed auth, keep capturing): {payload['file']}")
+                elif event == "convert_done":
+                    self._on_convert_done(payload)
                 elif event == "pmkid":
                     self._notify_capture("PMKID Captured", payload["file"])
                 elif event == "wps_line":
@@ -3173,11 +3422,75 @@ class N2NgApp:
         is_hash = bool(primary and is_hashcat_22000_file(primary))
         has_hash = self._selected_hash_path() is not None
         self.inspect_btn.config(state=tk.NORMAL if primary else tk.DISABLED)
-        self.convert_btn.config(state=tk.NORMAL if is_capture else tk.DISABLED)
         self.fix_btn.config(state=tk.NORMAL if is_capture else tk.DISABLED)
         self.merge_btn.config(state=tk.NORMAL if self._can_merge_captures(selected) else tk.DISABLED)
         self.hashcat_btn.config(state=tk.NORMAL if (is_hash or has_hash) else tk.DISABLED)
+        self._update_verdict_badge(primary)
         self._set_history_details(self._history_details_text(primary))
+        # Lazy safety net: auto-convert a selected capture that has no .22000 yet.
+        if is_capture and self._find_related_22000(primary) is None:
+            self._convert_capture_async(primary)
+
+    def _classify_22000_cached(self, path: Path) -> str:
+        """classify_22000() cached per path+mtime to avoid re-reading on every refresh."""
+        key = str(path)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return VERDICT_NONE
+        cached = self._verdict_cache.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        verdict = classify_22000(path)
+        self._verdict_cache[key] = (mtime, verdict)
+        return verdict
+
+    VERDICT_BADGE_STYLES = {
+        VERDICT_AUTHORIZED: ("AUTHORIZED", "#1b5e20", "#ffffff"),
+        VERDICT_CHALLENGE: ("CHALLENGE", "#e65100", "#ffffff"),
+        VERDICT_PMKID: ("PMKID", "#1b5e20", "#ffffff"),
+        VERDICT_NONE: ("NO PAIR", "#424242", "#ff6666"),
+    }
+
+    def _update_verdict_badge(self, primary: Path | None):
+        verdict = "—"
+        if primary:
+            hash_path = primary if is_hashcat_22000_file(primary) else self._find_related_22000(primary)
+            if hash_path:
+                verdict = self._classify_22000_cached(hash_path)
+        text, bg, fg = self.VERDICT_BADGE_STYLES.get(verdict, ("—", THEME["panel"], THEME["fg"]))
+        self.verdict_badge.config(text=text, bg=bg, fg=fg)
+
+    def _convert_capture_async(self, cap: Path):
+        """Convert cap to .22000 in a background thread; result arrives as a convert_done event."""
+        if not self.capture_manager or not is_supported_capture(cap):
+            return
+        key = str(cap)
+        if key in self._lazy_convert_attempted:
+            return
+        self._lazy_convert_attempted.add(key)
+
+        def _run():
+            try:
+                result = self.capture_manager.convert_to_22000(cap)
+            except Exception as exc:
+                result = CaptureProcessResult(False, message=f"Auto-convert failed: {exc}")
+            self.queue.put(("convert_done", {"cap": key, "result": result}))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_convert_done(self, payload):
+        result = payload["result"]
+        cap_name = Path(payload["cap"]).name
+        if result.ok and result.output:
+            self._log(f"Auto-converted {cap_name} -> {result.output.name}")
+            # Keep the user's current selection; only fall back to the new
+            # .22000 when nothing valid is selected anymore.
+            current = self._primary_history_path()
+            self._refresh_history(select_path=current if current and current.exists() else result.output)
+        else:
+            self._log(f"Auto-convert of {cap_name}: {result.message}")
+            self._update_history_selection()
 
     def _build_history_actions_menu(self, primary_cap: Path | None = None) -> tk.Menu:
         selected = self._history_selected_paths()
@@ -3193,7 +3506,6 @@ class N2NgApp:
 
         menu = tk.Menu(self.root, tearoff=0, bg=THEME["panel"], fg=THEME["fg"])
         menu.add_command(label="Inspect", state=inspect_state, command=self._inspect_selected_capture)
-        menu.add_command(label="Convert to 22000", state=convert_state, command=self._convert_selected_to_22000)
         menu.add_command(
             label="Copy hashcat command",
             state=content_state,
@@ -3253,15 +3565,6 @@ class N2NgApp:
         elif current and current.exists():
             select_path = current
         self._refresh_history(select_path=select_path)
-
-    def _convert_selected_to_22000(self):
-        primary = self._primary_history_path()
-        if not primary or not is_supported_capture(primary):
-            return
-        dialog = ConversionDialog(self.root, primary, self.capture_manager, mode="22000")
-        self.root.wait_window(dialog)
-        if dialog.result:
-            self._complete_history_operation(dialog.result)
 
     def _normalize_selected_to_pcapng(self):
         primary = self._primary_history_path()
@@ -3368,6 +3671,7 @@ class N2NgApp:
             messagebox.showinfo("N2-ng", f"Fixed capture saved to:\n{result.output}")
             self._log(f"Fixed {cap.name} -> {result.output.name}")
             self._complete_history_operation(result)
+            self._convert_capture_async(result.output)
         else:
             self._complete_history_operation(result)
             messagebox.showwarning("N2-ng", self._process_result_details(result))
@@ -3392,10 +3696,57 @@ class N2NgApp:
         if result.ok and result.output:
             messagebox.showinfo("N2-ng", f"Merged capture saved to:\n{result.output}")
             self._log(f"Merged {len(caps)} captures -> {result.output.name}")
+            if self.settings.get("merge_archive_originals"):
+                self._archive_merge_sources(caps, result)
             self._complete_history_operation(result)
+            self._convert_capture_async(result.output)
         else:
             self._complete_history_operation(result)
             messagebox.showwarning("N2-ng", self._process_result_details(result))
+
+    def _archive_merge_sources(self, caps: list[Path], result: CaptureProcessResult):
+        """Move merge sources to <capture_root>/.archive/YYYY-MM-DD/ after a verified merge."""
+        output = result.output
+        if result.returncode != 0 or not output or not output.exists() or output.stat().st_size == 0:
+            self._log(f"Merge output failed verification; sources left untouched: {[c.name for c in caps]}")
+            return
+        if not self._verify_merged_capture(caps, output):
+            self._log("Warning: hcxpcapngtool found no WPA records in the merged output; sources left untouched.")
+            return
+        archive_dir = capture_root() / ".archive" / time.strftime("%Y-%m-%d")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for cap in caps:
+            if not cap.exists():
+                continue
+            dest = unique_path(archive_dir / cap.name)
+            try:
+                shutil.move(str(cap), str(dest))
+                self._log(f"Archived {cap.name} -> {dest}")
+            except OSError as e:
+                self._log(f"Warning: could not archive {cap.name}: {e}")
+
+    def _verify_merged_capture(self, caps: list[Path], output: Path) -> bool:
+        """Sanity-check the merged output with hcxpcapngtool when sources contained WPA records."""
+        hcx = DependencyChecker.resolve_tool("hcxpcapngtool")
+        if not hcx.installed:
+            return True
+        source_records = sum(self._hcx_wpa_records(cap, hcx.path) for cap in caps)
+        if source_records == 0:
+            return True
+        return self._hcx_wpa_records(output, hcx.path) > 0
+
+    def _hcx_wpa_records(self, cap: Path, hcx_path: str) -> int:
+        """Return the number of WPA records hcxpcapngtool extracts from cap, 0 on failure."""
+        tmp = cap.with_suffix(".tmp22000")
+        try:
+            rc = subprocess.run([hcx_path, "-o", str(tmp), str(cap)], capture_output=True, text=True, timeout=120)
+            if rc.returncode == 0 and tmp.exists():
+                return hashcat_22000_info(tmp)["records"]
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            tmp.unlink(missing_ok=True)
+        return 0
 
     def _update_clients(self, clients: list[dict]):
         self.clients = clients
@@ -3501,6 +3852,19 @@ class N2NgApp:
                 return (text == "", text) if col == "essid" else text
             return str(raw).lower()
 
+        def tiebreak_num(net, key, invalid):
+            try:
+                return int(net.get(key, ""))
+            except (TypeError, ValueError):
+                return invalid
+
+        # Two-level sort: PWR ties break by CH ascending, CH ties break by
+        # PWR descending (stable pre-sort on the secondary key). Other
+        # columns keep their single-key behavior.
+        if col == "pwr":
+            networks = sorted(networks, key=lambda net: tiebreak_num(net, "channel", 9999))
+        elif col == "ch":
+            networks = sorted(networks, key=lambda net: tiebreak_num(net, "power", -9999), reverse=True)
         return sorted(networks, key=sort_val, reverse=reverse)
 
     def _network_values(self, net: dict) -> tuple:
@@ -3611,7 +3975,7 @@ class N2NgApp:
             self._cancel_after(attr)
         if hasattr(self, "wps_scanner"):
             self.wps_scanner.stop()
-        self.attack.stop_current()
+        self.attack.stop_all()
         self.worker.shutdown()
         self.airmon.cleanup()
 

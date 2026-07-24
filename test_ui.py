@@ -252,14 +252,14 @@ def test_stop_attack_stops_controller_and_auto_deauth():
     root = tk.Tk()
     root.withdraw()
     app = _n2ng.N2NgApp(root)
-    app.attack.stop_current = Mock(return_value=True)
+    app.attack.stop_all = Mock(return_value=2)
     app.auto_deauth_var.set(True)
 
     app._stop_attack()
 
-    app.attack.stop_current.assert_called_once()
+    app.attack.stop_all.assert_called_once()
     assert app.auto_deauth_var.get() is False
-    assert "Attack stopped" in app.status.cget("text")
+    assert "All attack processes stopped (2 killed)" in app.status.cget("text")
     root.destroy()
 
 
@@ -444,7 +444,7 @@ def test_capture_sessions_panel_has_visible_workflow_controls():
     assert app.capture_sessions_frame.cget("text") == "Capture Sessions"
     assert "Select a capture" in app.capture_sessions_description.cget("text")
     assert app.inspect_btn.cget("text") == "Inspect"
-    assert app.convert_btn.cget("text") == "Convert to 22000"
+    assert app.verdict_badge.cget("text") == "—"
     assert app.fix_btn.cget("text") == "Fix Capture"
     assert app.merge_btn.cget("text") == "Merge"
     assert app.hashcat_btn.cget("text") == "Hashcat"
@@ -514,13 +514,13 @@ def test_capture_action_states_for_hash_and_capture_files(tmp_path):
     cap_item = next(item for item in app.history_tree.get_children() if Path(app.history_tree.item(item, "values")[3]) == cap)
     app.history_tree.selection_set(cap_item)
     app._update_history_selection()
-    assert str(app.convert_btn.cget("state")) == tk.NORMAL
+    assert app.verdict_badge.cget("text") == "AUTHORIZED"
     assert str(app.fix_btn.cget("state")) == tk.NORMAL
 
     hash_item = next(item for item in app.history_tree.get_children() if Path(app.history_tree.item(item, "values")[3]) == hash_file)
     app.history_tree.selection_set(hash_item)
     app._update_history_selection()
-    assert str(app.convert_btn.cget("state")) == tk.DISABLED
+    assert app.verdict_badge.cget("text") == "AUTHORIZED"
     assert str(app.fix_btn.cget("state")) == tk.DISABLED
     assert str(app.hashcat_btn.cget("state")) == tk.NORMAL
     root.destroy()
@@ -899,4 +899,144 @@ def test_power_update_does_not_flash_row():
     app._update_networks([net])
     tags = app.tree.item(bssid, "tags")
     assert "flash" not in tags
+    root.destroy()
+
+
+def test_verdict_badge_shows_selected_session_verdict(tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    cap = tmp_path / "capture.cap"
+    hash_file = tmp_path / "capture.22000"
+    cap.write_bytes(b"pcap")
+    hash_file.write_text("WPA*02*aa11*bb22*cc33*64646464*ee55*ff66*02\n")
+    app._set_history_items([cap, hash_file])
+
+    # Nothing selected: no verdict yet.
+    assert app.verdict_badge.cget("text") == "—"
+
+    cap_item = next(item for item in app.history_tree.get_children() if Path(app.history_tree.item(item, "values")[3]) == cap)
+    app.history_tree.selection_set(cap_item)
+    app._update_history_selection()
+    assert app.verdict_badge.cget("text") == "AUTHORIZED"
+    root.destroy()
+
+
+def test_verdict_badge_challenge_and_no_pair(tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    challenge = tmp_path / "challenge.22000"
+    junk = tmp_path / "junk.22000"
+    challenge.write_text("WPA*02*aa11*bb22*cc33*64646464*ee55*ff66*00\n")
+    junk.write_text("garbage\n")
+    app._set_history_items([challenge, junk])
+
+    challenge_item = next(item for item in app.history_tree.get_children() if Path(app.history_tree.item(item, "values")[3]) == challenge)
+    app.history_tree.selection_set(challenge_item)
+    app._update_history_selection()
+    assert app.verdict_badge.cget("text") == "CHALLENGE"
+
+    junk_item = next(item for item in app.history_tree.get_children() if Path(app.history_tree.item(item, "values")[3]) == junk)
+    app.history_tree.selection_set(junk_item)
+    app._update_history_selection()
+    assert app.verdict_badge.cget("text") == "NO PAIR"
+    root.destroy()
+
+
+def test_verdict_cache_rechecks_after_regeneration(tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    hash_file = tmp_path / "capture.22000"
+    hash_file.write_text("WPA*02*aa11*bb22*cc33*64646464*ee55*ff66*00\n")
+
+    assert app._classify_22000_cached(hash_file) == "CHALLENGE"
+    # Same mtime: cached verdict is reused.
+    assert app._classify_22000_cached(hash_file) == "CHALLENGE"
+    # Regenerated file (new mtime): verdict is recomputed.
+    hash_file.write_text("WPA*02*aa11*bb22*cc33*64646464*ee55*ff66*02\n")
+    os.utime(hash_file, (hash_file.stat().st_atime, hash_file.stat().st_mtime + 1))
+    assert app._classify_22000_cached(hash_file) == "AUTHORIZED"
+    root.destroy()
+
+
+def test_lazy_convert_triggered_once_for_cap_without_22000(monkeypatch, tmp_path):
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
+    cap = tmp_path / "lazy_no22000.cap"
+    cap.write_bytes(b"pcap")
+    convert = Mock(return_value=_n2ng.CaptureProcessResult(False, message="no hashes"))
+    app.capture_manager.convert_to_22000 = convert
+    app._set_history_items([cap])
+
+    cap_item = next(item for item in app.history_tree.get_children() if Path(app.history_tree.item(item, "values")[3]) == cap)
+    app.history_tree.selection_set(cap_item)
+    app._update_history_selection()
+    for _ in range(20):
+        if convert.call_count:
+            break
+        time.sleep(0.05)
+    app._update_history_selection()
+
+    # The background conversion runs exactly once per path (duplicate guard).
+    convert.assert_called_once_with(cap)
+    assert str(cap) in app._lazy_convert_attempted
+    root.destroy()
+
+
+def test_auto_deauth_continues_on_unverified_challenge():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.auto_deauth_var.set(True)
+    app.locked_target = {"bssid": "AA:BB:CC:DD:EE:FF", "essid": "Test"}
+    app.mon_iface = "wlan0mon"
+    app.attack.deauth_all = Mock()
+    # A challenge-only classification sets neither stop flag.
+    app.capture_manager.handshake_found = False
+    app.capture_manager.pmkid_found = False
+
+    app._auto_deauth_tick()
+
+    app.attack.deauth_all.assert_called_once()
+    assert app.auto_deauth_var.get() is True
+    root.destroy()
+
+
+def test_pwr_sort_ties_break_by_channel_ascending():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    networks = [
+        {"bssid": "AA:00:00:00:00:01", "power": "-50", "channel": "6"},
+        {"bssid": "AA:00:00:00:00:02", "power": "-50", "channel": "1"},
+        {"bssid": "AA:00:00:00:00:03", "power": "-40", "channel": "11"},
+    ]
+    app._sort_col = "pwr"
+    app._sort_reverse = True
+
+    ordered = [net["bssid"] for net in app._sort_networks(networks)]
+
+    assert ordered == ["AA:00:00:00:00:03", "AA:00:00:00:00:02", "AA:00:00:00:00:01"]
+    root.destroy()
+
+
+def test_channel_sort_ties_break_by_power_descending():
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    networks = [
+        {"bssid": "AA:00:00:00:00:01", "power": "-50", "channel": "6"},
+        {"bssid": "AA:00:00:00:00:02", "power": "-30", "channel": "6"},
+        {"bssid": "AA:00:00:00:00:03", "power": "-99", "channel": "1"},
+    ]
+    app._sort_col = "ch"
+    app._sort_reverse = False
+
+    ordered = [net["bssid"] for net in app._sort_networks(networks)]
+
+    assert ordered == ["AA:00:00:00:00:03", "AA:00:00:00:00:02", "AA:00:00:00:00:01"]
     root.destroy()
