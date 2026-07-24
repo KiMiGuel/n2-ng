@@ -1151,6 +1151,7 @@ class AttackController:
     def __init__(self, log_func):
         self.log = log_func
         self._current = None
+        self._procs = set()
         self._lock = threading.Lock()
 
     def _run(self, cmd: list[str]):
@@ -1158,10 +1159,12 @@ class AttackController:
         proc = None
         try:
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                start_new_session=True,
             )
             with self._lock:
                 self._current = proc
+                self._procs.add(proc)
             if proc.stdout:
                 for line in proc.stdout:
                     self.log(line.rstrip())
@@ -1170,6 +1173,7 @@ class AttackController:
             self.log(f"Attack failed: {e}")
         finally:
             with self._lock:
+                self._procs.discard(proc)
                 if self._current is proc:
                     self._current = None
 
@@ -1190,6 +1194,28 @@ class AttackController:
             except Exception:
                 pass
         return True
+
+    def stop_all(self) -> int:
+        """Terminate every live attack process group; escalate to SIGKILL after a grace period."""
+        with self._lock:
+            procs = [p for p in self._procs if p.poll() is None]
+        killed = 0
+        for p in procs:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                killed += 1
+            except (ProcessLookupError, OSError):
+                pass
+        deadline = time.monotonic() + 2
+        while any(p.poll() is None for p in procs) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+        return killed
 
     def deauth_all(self, bssid: str, mon_iface: str, count: int = 10):
         cmd = ["aireplay-ng", "-0", str(count), "-a", bssid, mon_iface]
@@ -1630,7 +1656,7 @@ class WpsScanner(threading.Thread):
         else:
             self.callback("error", "wash/reaver not found")
             return
-        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         while not self._stop.is_set():
             line = self._proc.stdout.readline()
             if not line:
@@ -1640,15 +1666,19 @@ class WpsScanner(threading.Thread):
 
     def stop(self):
         self._stop.set()
-        if self._proc:
+        if not self._proc:
+            return
+        try:
+            os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            return
+        try:
+            self._proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
             try:
-                self._proc.terminate()
-                self._proc.wait(timeout=2)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
 
 
 class AirodumpRawView:
@@ -2963,8 +2993,8 @@ class N2NgApp:
 
     def _stop_attack(self):
         self.auto_deauth_var.set(False)
-        stopped = self.attack.stop_current()
-        text = "Attack stopped" if stopped else "No attack process running"
+        stopped = self.attack.stop_all()
+        text = f"All attack processes stopped ({stopped} killed)" if stopped else "No attack process running"
         self.status.config(text=text, bg=THEME["panel"], fg=THEME["fg"])
         self._log(text)
 
@@ -3611,7 +3641,7 @@ class N2NgApp:
             self._cancel_after(attr)
         if hasattr(self, "wps_scanner"):
             self.wps_scanner.stop()
-        self.attack.stop_current()
+        self.attack.stop_all()
         self.worker.shutdown()
         self.airmon.cleanup()
 
