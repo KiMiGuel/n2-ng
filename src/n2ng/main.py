@@ -617,6 +617,8 @@ class AirmonManager:
         self._mon_map: dict[str, str] = {}
         # Maps interface -> permanent MAC read from sysfs before randomization
         self._orig_macs: dict[str, str] = {}
+        # Interfaces that were already in monitor mode before n2-ng used them
+        self._preexisting: set[str] = set()
 
     @staticmethod
     def _list_interfaces() -> set[str]:
@@ -719,7 +721,10 @@ class AirmonManager:
         # If the selected interface is already in monitor mode, use it directly.
         if self._is_monitor(iface):
             self._mon_map[iface] = iface
+            self._preexisting.add(iface)
             return iface
+        # We are creating the monitor ourselves; it is no longer pre-existing.
+        self._preexisting.discard(iface)
         # Stop any previous monitor for this iface
         self.stop_monitor_for_iface(iface)
         before = self._list_interfaces()
@@ -752,6 +757,9 @@ class AirmonManager:
 
     def stop_monitor_for_iface(self, iface: str) -> None:
         mon = self._mon_map.pop(iface, None)
+        if mon and mon in self._preexisting:
+            # Pre-existing monitor: never stop it
+            return
         if mon and mon != iface:
             subprocess.run(["airmon-ng", "stop", mon], capture_output=True, text=True)
         elif mon == iface:
@@ -766,12 +774,17 @@ class AirmonManager:
         subprocess.run(["airmon-ng", "stop", iface], capture_output=True, text=True)
 
     def stop_monitor(self, mon_iface: str) -> None:
-        if mon_iface:
+        if mon_iface and mon_iface not in self._preexisting:
             subprocess.run(["airmon-ng", "stop", mon_iface], capture_output=True, text=True)
 
     def cleanup(self) -> None:
         for iface in list(self._mon_map.keys()):
+            if self._mon_map.get(iface) in self._preexisting:
+                # Pre-existing monitor: leave it running, just forget it
+                self._mon_map.pop(iface, None)
+                continue
             self.stop_monitor_for_iface(iface)
+            print(f"Adapter restored to managed mode ({iface})")
         for iface in list(self._orig_macs.keys()):
             self.restore_mac(iface)
 
@@ -2603,12 +2616,18 @@ class N2NgApp:
     def _stop_monitor(self):
         self.worker.stop()
         self.worker.clear_latest()
+        status_text = "Monitor stopped"
         if self.mon_iface:
-            self.airmon.stop_monitor(self.mon_iface)
+            if self.mon_iface in self.airmon._preexisting:
+                # Pre-existing monitor: leave it running, just clear our state
+                self.airmon._mon_map.pop(self.mon_iface, None)
+                status_text = "Pre-existing monitor kept"
+            else:
+                self.airmon.stop_monitor(self.mon_iface)
             self.mon_iface = None
         self._restore_rand_mac()
         self._update_mac_label()
-        self.status.config(text="Monitor stopped")
+        self.status.config(text=status_text)
         self.channel_pill.config(text="SCANNING ALL", bg="red")
         self.pause_btn.config(text="Pause Scan", state=tk.DISABLED, width=10)
 
