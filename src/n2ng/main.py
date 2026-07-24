@@ -2938,13 +2938,22 @@ class N2NgApp:
     # Attack handlers
     # ------------------------------------------------------------------
     def _our_mac(self) -> str | None:
+        mac = None
         try:
-            out = subprocess.check_output(["ip", "link", "show", self.mon_iface], text=True, stderr=subprocess.DEVNULL)
-            m = re.search(r"link/ether\s+([0-9a-f:]{17})", out)
-            if m:
-                return m.group(1).upper()
+            with open(f"/sys/class/net/{self.mon_iface}/address") as f:
+                mac = f.read().strip()
         except Exception:
             pass
+        if mac is None:
+            try:
+                out = subprocess.check_output(["ip", "link", "show", self.mon_iface], text=True, stderr=subprocess.DEVNULL)
+                m = re.search(r"link/ether\s+([0-9a-f:]{17})", out)
+                if m:
+                    mac = m.group(1)
+            except Exception:
+                pass
+        if mac and re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac.lower()):
+            return mac.upper()
         return None
 
     def _confirm_attack(self, cmd: list[str]) -> bool:
