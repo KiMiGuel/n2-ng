@@ -1,3 +1,5 @@
+**En Español haz click [aquí](https://github.com/KiMiGuel/n2-ng/blob/spanish/README.md)**
+
 <p align="center">
   <img src="docs/n2-ng-banner.png" alt="N2-NG Banner" width="100%">
 </p>
