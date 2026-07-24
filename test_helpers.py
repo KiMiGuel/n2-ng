@@ -461,3 +461,18 @@ def test_start_monitor_uses_iface_directly_when_already_monitor_mode(monkeypatch
     assert airmon.start_monitor("wlan0mon") == "wlan0mon"
     assert not any(cmd[0] == "airmon-ng" for cmd in run_calls)
     assert airmon._mon_map.get("wlan0mon") == "wlan0mon"
+
+
+clamp_to_screen = _n2ng.clamp_to_screen
+
+
+def test_clamp_to_screen_keeps_default_on_large_display():
+    assert clamp_to_screen(1320, 760, 1920, 1080) == (1320, 760)
+
+
+def test_clamp_to_screen_shrinks_to_fit_small_display():
+    assert clamp_to_screen(1320, 760, 800, 480) == (800, 480)
+
+
+def test_clamp_to_screen_applies_margins():
+    assert clamp_to_screen(900, 560, 800, 480, margin_w=40, margin_h=60) == (760, 420)

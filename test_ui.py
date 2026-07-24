@@ -252,14 +252,14 @@ def test_stop_attack_stops_controller_and_auto_deauth():
     root = tk.Tk()
     root.withdraw()
     app = _n2ng.N2NgApp(root)
-    app.attack.stop_current = Mock(return_value=True)
+    app.attack.stop_all = Mock(return_value=2)
     app.auto_deauth_var.set(True)
 
     app._stop_attack()
 
-    app.attack.stop_current.assert_called_once()
+    app.attack.stop_all.assert_called_once()
     assert app.auto_deauth_var.get() is False
-    assert "Attack stopped" in app.status.cget("text")
+    assert "All attack processes stopped (2 killed)" in app.status.cget("text")
     root.destroy()
 
 

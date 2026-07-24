@@ -224,6 +224,11 @@ def human_size(size: int) -> str:
     return f"{size:.1f} GB"
 
 
+def clamp_to_screen(width: int, height: int, scr_w: int, scr_h: int, margin_w: int = 0, margin_h: int = 0) -> tuple[int, int]:
+    """Clamp a window size so it fits on small displays (e.g. 800x480)."""
+    return (min(width, max(1, scr_w - margin_w)), min(height, max(1, scr_h - margin_h)))
+
+
 def user_home() -> Path:
     """Return the original user's home directory even when running under sudo."""
     sudo_user = os.environ.get("SUDO_USER")
@@ -1618,7 +1623,8 @@ class HashcatDialog(tk.Toplevel):
         self.session_name = f"n2ng-{int(time.time())}"
         self.title("N2-ng Hashcat")
         self.configure(bg=THEME["panel"])
-        self.geometry("820x520")
+        dlg_w, dlg_h = clamp_to_screen(820, 520, self.winfo_screenwidth(), self.winfo_screenheight())
+        self.geometry(f"{dlg_w}x{dlg_h}")
         self.transient(parent)
 
         tk.Label(self, text="Hashcat dictionary attack", bg=THEME["panel"], fg=THEME["fg"], font=("TkDefaultFont", 12, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 4))
@@ -2012,8 +2018,11 @@ class N2NgApp:
         self.root = root
         self.demo_mode = demo_mode
         self.root.title(f"N2-ng v{__version__}")
-        self.root.geometry("1320x760")
-        self.root.minsize(900, 560)
+        scr_w, scr_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        init_w, init_h = clamp_to_screen(1320, 760, scr_w, scr_h)
+        self.root.geometry(f"{init_w}x{init_h}")
+        min_w, min_h = clamp_to_screen(900, 560, scr_w, scr_h, margin_w=40, margin_h=60)
+        self.root.minsize(min_w, min_h)
         self.root.configure(bg=THEME["bg"])
 
         self.queue = queue.Queue()
@@ -2199,12 +2208,12 @@ class N2NgApp:
 
         # Left: network tree
         left_frame = tk.Frame(self.content_frame, bg=THEME["bg"])
-        self.content_pane.add(left_frame, minsize=380, stretch="always")
+        self.content_pane.add(left_frame, minsize=320, stretch="always")
         self._build_network_tree(left_frame)
 
         # Right: notebook with Scan and Raw View tabs
         right_frame = tk.Frame(self.content_frame, bg=THEME["bg"])
-        self.content_pane.add(right_frame, minsize=460, stretch="always")
+        self.content_pane.add(right_frame, minsize=400, stretch="always")
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
