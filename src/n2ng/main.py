@@ -28,7 +28,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 try:
     from . import __version__
 except ImportError:
-    __version__ = "1.0.0"
+    __version__ = "1.1.0"
 
 
 THEME = {
@@ -320,6 +320,52 @@ def hashcat_22000_info(path: Path) -> dict:
 
 def is_hashcat_22000_file(path: Path) -> bool:
     return path.suffix.lower() == ".22000"
+
+
+# Verdicts returned by classify_22000_text / classify_22000.
+VERDICT_AUTHORIZED = "AUTHORIZED"
+VERDICT_CHALLENGE = "CHALLENGE"
+VERDICT_PMKID = "PMKID"
+VERDICT_NONE = "NONE"
+
+
+def classify_22000_text(text: str) -> str:
+    """Classify hc22000 content by handshake verifiability.
+
+    The MESSAGEPAIR byte (last *-separated field of a WPA*02 line) identifies
+    the captured EAPOL message pair in its low 3 bits: 0 = M1+M2 "challenge"
+    (UNVERIFIED, may come from a failed/wrong-password auth), 1-5 = pairs
+    where the AP accepted the client's proof ("authorized").  Upper bits are
+    flags (e.g. 0x80 = nonce-error-correction) and are masked off with & 0x07.
+    WPA*01 lines are PMKIDs, which are always valid attack material.
+    """
+    saw_eapol = False
+    saw_pmkid = False
+    for line in text.splitlines():
+        if line.startswith("WPA*01*"):
+            saw_pmkid = True
+        elif line.startswith("WPA*02*"):
+            saw_eapol = True
+            try:
+                messagepair = int(line.rsplit("*", 1)[-1], 16) & 0x07
+            except ValueError:
+                continue
+            if messagepair in (1, 2, 3, 4, 5):
+                return VERDICT_AUTHORIZED
+    if saw_eapol:
+        return VERDICT_CHALLENGE
+    if saw_pmkid:
+        return VERDICT_PMKID
+    return VERDICT_NONE
+
+
+def classify_22000(path: Path) -> str:
+    """Classify a .22000 file: AUTHORIZED / CHALLENGE / PMKID / NONE."""
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return VERDICT_NONE
+    return classify_22000_text(text)
 
 
 def default_hashcat_wordlist() -> Path | None:
@@ -1338,12 +1384,14 @@ class CaptureManager:
         self.active_cap: Path | None = None
         self.handshake_found = False
         self.pmkid_found = False
+        self.challenge_seen = False
         self._last_size = 0
 
     def set_active_cap(self, cap_path: Path):
         self.active_cap = cap_path
         self.handshake_found = False
         self.pmkid_found = False
+        self.challenge_seen = False
         self._last_size = 0
 
     def get_size(self) -> int:
@@ -1383,10 +1431,19 @@ class CaptureManager:
             tmp.unlink(missing_ok=True)
 
     def _classify(self, path: Path):
-        text = path.read_text(errors="ignore")
-        if "WPA*02" in text and not self.handshake_found:
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            return
+        verdict = classify_22000_text(text)
+        if verdict == VERDICT_AUTHORIZED and not self.handshake_found:
+            # The AP accepted the client's proof: this handshake is crackable.
             self.handshake_found = True
             self.queue.put(("handshake", {"file": str(path), "type": "handshake"}))
+        elif verdict == VERDICT_CHALLENGE and not self.challenge_seen and not self.handshake_found:
+            # M1+M2 only: possibly a failed/wrong-password auth. Keep capturing.
+            self.challenge_seen = True
+            self.queue.put(("challenge", {"file": str(path), "type": "handshake"}))
         if "WPA*01" in text and not self.pmkid_found:
             self.pmkid_found = True
             self.queue.put(("pmkid", {"file": str(path), "type": "pmkid"}))
@@ -2052,6 +2109,8 @@ class N2NgApp:
         self._context_menu = None
         self._history_paths: dict[str, Path] = {}
         self._last_history_result = ""
+        self._verdict_cache: dict[str, tuple[float, str]] = {}
+        self._lazy_convert_attempted: set[str] = set()
         self.hashcat_dialog = None
 
         # Column visibility / sorting state for the network tree.
@@ -2421,11 +2480,13 @@ class N2NgApp:
         action_bar = tk.Frame(hist_frame, bg=THEME["panel"])
         action_bar.pack(fill=tk.X, padx=4, pady=2)
         self.inspect_btn = tk.Button(action_bar, text="Inspect", command=self._inspect_selected_capture, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
-        self.convert_btn = tk.Button(action_bar, text="Convert to 22000", command=self._convert_selected_to_22000, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
+        self.verdict_badge = tk.Label(action_bar, text="—", bg=THEME["panel"], fg=THEME["fg"], width=11, relief=tk.RIDGE, bd=1)
         self.fix_btn = tk.Button(action_bar, text="Fix Capture", command=self._fix_selected_capture, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
         self.merge_btn = tk.Button(action_bar, text="Merge", command=self._merge_selected, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
         self.hashcat_btn = tk.Button(action_bar, text="Hashcat", command=self._open_hashcat_for_selection, bg=THEME["panel"], fg=THEME["fg"], state=tk.DISABLED)
-        for button in (self.inspect_btn, self.convert_btn, self.fix_btn, self.merge_btn, self.hashcat_btn):
+        self.inspect_btn.pack(side=tk.LEFT, padx=2)
+        self.verdict_badge.pack(side=tk.LEFT, padx=4)
+        for button in (self.fix_btn, self.merge_btn, self.hashcat_btn):
             button.pack(side=tk.LEFT, padx=2)
 
         # Auto-refresh the capture-sessions history every 20 seconds.
@@ -3206,6 +3267,10 @@ class N2NgApp:
                     break
                 if event == "handshake":
                     self._notify_capture("WPA Handshake Captured", payload["file"])
+                elif event == "challenge":
+                    self._log(f"Handshake UNVERIFIED (M1+M2 challenge only — possible failed auth, keep capturing): {payload['file']}")
+                elif event == "convert_done":
+                    self._on_convert_done(payload)
                 elif event == "pmkid":
                     self._notify_capture("PMKID Captured", payload["file"])
                 elif event == "wps_line":
@@ -3357,11 +3422,75 @@ class N2NgApp:
         is_hash = bool(primary and is_hashcat_22000_file(primary))
         has_hash = self._selected_hash_path() is not None
         self.inspect_btn.config(state=tk.NORMAL if primary else tk.DISABLED)
-        self.convert_btn.config(state=tk.NORMAL if is_capture else tk.DISABLED)
         self.fix_btn.config(state=tk.NORMAL if is_capture else tk.DISABLED)
         self.merge_btn.config(state=tk.NORMAL if self._can_merge_captures(selected) else tk.DISABLED)
         self.hashcat_btn.config(state=tk.NORMAL if (is_hash or has_hash) else tk.DISABLED)
+        self._update_verdict_badge(primary)
         self._set_history_details(self._history_details_text(primary))
+        # Lazy safety net: auto-convert a selected capture that has no .22000 yet.
+        if is_capture and self._find_related_22000(primary) is None:
+            self._convert_capture_async(primary)
+
+    def _classify_22000_cached(self, path: Path) -> str:
+        """classify_22000() cached per path+mtime to avoid re-reading on every refresh."""
+        key = str(path)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return VERDICT_NONE
+        cached = self._verdict_cache.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        verdict = classify_22000(path)
+        self._verdict_cache[key] = (mtime, verdict)
+        return verdict
+
+    VERDICT_BADGE_STYLES = {
+        VERDICT_AUTHORIZED: ("AUTHORIZED", "#1b5e20", "#ffffff"),
+        VERDICT_CHALLENGE: ("CHALLENGE", "#e65100", "#ffffff"),
+        VERDICT_PMKID: ("PMKID", "#1b5e20", "#ffffff"),
+        VERDICT_NONE: ("NO PAIR", "#424242", "#ff6666"),
+    }
+
+    def _update_verdict_badge(self, primary: Path | None):
+        verdict = "—"
+        if primary:
+            hash_path = primary if is_hashcat_22000_file(primary) else self._find_related_22000(primary)
+            if hash_path:
+                verdict = self._classify_22000_cached(hash_path)
+        text, bg, fg = self.VERDICT_BADGE_STYLES.get(verdict, ("—", THEME["panel"], THEME["fg"]))
+        self.verdict_badge.config(text=text, bg=bg, fg=fg)
+
+    def _convert_capture_async(self, cap: Path):
+        """Convert cap to .22000 in a background thread; result arrives as a convert_done event."""
+        if not self.capture_manager or not is_supported_capture(cap):
+            return
+        key = str(cap)
+        if key in self._lazy_convert_attempted:
+            return
+        self._lazy_convert_attempted.add(key)
+
+        def _run():
+            try:
+                result = self.capture_manager.convert_to_22000(cap)
+            except Exception as exc:
+                result = CaptureProcessResult(False, message=f"Auto-convert failed: {exc}")
+            self.queue.put(("convert_done", {"cap": key, "result": result}))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_convert_done(self, payload):
+        result = payload["result"]
+        cap_name = Path(payload["cap"]).name
+        if result.ok and result.output:
+            self._log(f"Auto-converted {cap_name} -> {result.output.name}")
+            # Keep the user's current selection; only fall back to the new
+            # .22000 when nothing valid is selected anymore.
+            current = self._primary_history_path()
+            self._refresh_history(select_path=current if current and current.exists() else result.output)
+        else:
+            self._log(f"Auto-convert of {cap_name}: {result.message}")
+            self._update_history_selection()
 
     def _build_history_actions_menu(self, primary_cap: Path | None = None) -> tk.Menu:
         selected = self._history_selected_paths()
@@ -3377,7 +3506,6 @@ class N2NgApp:
 
         menu = tk.Menu(self.root, tearoff=0, bg=THEME["panel"], fg=THEME["fg"])
         menu.add_command(label="Inspect", state=inspect_state, command=self._inspect_selected_capture)
-        menu.add_command(label="Convert to 22000", state=convert_state, command=self._convert_selected_to_22000)
         menu.add_command(
             label="Copy hashcat command",
             state=content_state,
@@ -3437,15 +3565,6 @@ class N2NgApp:
         elif current and current.exists():
             select_path = current
         self._refresh_history(select_path=select_path)
-
-    def _convert_selected_to_22000(self):
-        primary = self._primary_history_path()
-        if not primary or not is_supported_capture(primary):
-            return
-        dialog = ConversionDialog(self.root, primary, self.capture_manager, mode="22000")
-        self.root.wait_window(dialog)
-        if dialog.result:
-            self._complete_history_operation(dialog.result)
 
     def _normalize_selected_to_pcapng(self):
         primary = self._primary_history_path()
@@ -3552,6 +3671,7 @@ class N2NgApp:
             messagebox.showinfo("N2-ng", f"Fixed capture saved to:\n{result.output}")
             self._log(f"Fixed {cap.name} -> {result.output.name}")
             self._complete_history_operation(result)
+            self._convert_capture_async(result.output)
         else:
             self._complete_history_operation(result)
             messagebox.showwarning("N2-ng", self._process_result_details(result))
@@ -3579,6 +3699,7 @@ class N2NgApp:
             if self.settings.get("merge_archive_originals"):
                 self._archive_merge_sources(caps, result)
             self._complete_history_operation(result)
+            self._convert_capture_async(result.output)
         else:
             self._complete_history_operation(result)
             messagebox.showwarning("N2-ng", self._process_result_details(result))
@@ -3731,6 +3852,19 @@ class N2NgApp:
                 return (text == "", text) if col == "essid" else text
             return str(raw).lower()
 
+        def tiebreak_num(net, key, invalid):
+            try:
+                return int(net.get(key, ""))
+            except (TypeError, ValueError):
+                return invalid
+
+        # Two-level sort: PWR ties break by CH ascending, CH ties break by
+        # PWR descending (stable pre-sort on the secondary key). Other
+        # columns keep their single-key behavior.
+        if col == "pwr":
+            networks = sorted(networks, key=lambda net: tiebreak_num(net, "channel", 9999))
+        elif col == "ch":
+            networks = sorted(networks, key=lambda net: tiebreak_num(net, "power", -9999), reverse=True)
         return sorted(networks, key=sort_val, reverse=reverse)
 
     def _network_values(self, net: dict) -> tuple:

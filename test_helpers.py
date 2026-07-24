@@ -25,7 +25,7 @@ def test_module_launch_has_no_duplicate_import_warning():
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "n2-ng 1.0.0"
+    assert result.stdout.strip() == "n2-ng 1.1.0"
     assert "RuntimeWarning" not in result.stderr
 
 
@@ -476,3 +476,79 @@ def test_clamp_to_screen_shrinks_to_fit_small_display():
 
 def test_clamp_to_screen_applies_margins():
     assert clamp_to_screen(900, 560, 800, 480, margin_w=40, margin_h=60) == (760, 420)
+
+
+classify_22000 = _n2ng.classify_22000
+classify_22000_text = _n2ng.classify_22000_text
+
+
+def _eapol_line(messagepair: str) -> str:
+    return f"WPA*02*aa11*bb22*cc33*64646464*ee55*ff66*{messagepair}"
+
+
+def test_classify_22000_authorized_messagepairs():
+    assert classify_22000_text(_eapol_line("02") + "\n") == "AUTHORIZED"
+    # 0x80 flag (nonce-error-correction) must be masked off: 0x82 & 0x07 == 2.
+    assert classify_22000_text(_eapol_line("82") + "\n") == "AUTHORIZED"
+    # Any authorized line wins even when challenge lines are also present.
+    text = _eapol_line("00") + "\n" + _eapol_line("05") + "\n"
+    assert classify_22000_text(text) == "AUTHORIZED"
+
+
+def test_classify_22000_challenge_messagepairs():
+    # 0x10 and 0x80 both mask to messagepair 0: M1+M2 challenge only.
+    assert classify_22000_text(_eapol_line("00") + "\n") == "CHALLENGE"
+    assert classify_22000_text(_eapol_line("10") + "\n") == "CHALLENGE"
+    assert classify_22000_text(_eapol_line("80") + "\n") == "CHALLENGE"
+
+
+def test_classify_22000_pmkid_and_empty():
+    assert classify_22000_text("WPA*01*aa11*bb22*cc33\n") == "PMKID"
+    assert classify_22000_text("") == "NONE"
+    assert classify_22000_text("garbage\n") == "NONE"
+
+
+def test_classify_22000_reads_file(tmp_path):
+    hash_file = tmp_path / "cap.22000"
+    hash_file.write_text(_eapol_line("03") + "\n")
+    assert classify_22000(hash_file) == "AUTHORIZED"
+    assert classify_22000(tmp_path / "missing.22000") == "NONE"
+
+
+def test_capture_gate_challenge_does_not_set_handshake_found(tmp_path):
+    manager = _n2ng.CaptureManager(_n2ng.queue.Queue(), lambda _msg: None)
+    challenge = tmp_path / "challenge.22000"
+    challenge.write_text(_eapol_line("00") + "\n")
+
+    manager._classify(challenge)
+
+    event, payload = manager.queue.get_nowait()
+    assert event == "challenge"
+    assert payload["file"] == str(challenge)
+    # The auto-deauth stop condition must stay false: keep capturing.
+    assert manager.handshake_found is False
+    assert manager.pmkid_found is False
+
+
+def test_capture_gate_authorized_fires_handshake(tmp_path):
+    manager = _n2ng.CaptureManager(_n2ng.queue.Queue(), lambda _msg: None)
+    authorized = tmp_path / "authorized.22000"
+    authorized.write_text(_eapol_line("82") + "\n")
+
+    manager._classify(authorized)
+
+    event, _payload = manager.queue.get_nowait()
+    assert event == "handshake"
+    assert manager.handshake_found is True
+
+
+def test_capture_gate_pmkid_still_fires(tmp_path):
+    manager = _n2ng.CaptureManager(_n2ng.queue.Queue(), lambda _msg: None)
+    pmkid = tmp_path / "pmkid.22000"
+    pmkid.write_text("WPA*01*aa11*bb22*cc33\n")
+
+    manager._classify(pmkid)
+
+    event, _payload = manager.queue.get_nowait()
+    assert event == "pmkid"
+    assert manager.pmkid_found is True
