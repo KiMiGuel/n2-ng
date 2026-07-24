@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/KiMiGuel/n2-ng/releases"><img src="https://img.shields.io/github/v/release/KiMiGuel/n2-ng?style=flat-square&color=%2300ff41&label=release" alt="Release"></a>
-  <img src="https://img.shields.io/badge/version-0.1.3-%2300ff41?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.0.0-%2300ff41?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square" alt="License">
   <img src="https://img.shields.io/badge/Kali-compatible-purple?style=flat-square" alt="Kali">

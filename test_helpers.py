@@ -25,7 +25,7 @@ def test_module_launch_has_no_duplicate_import_warning():
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "n2-ng 0.1.3"
+    assert result.stdout.strip() == "n2-ng 1.0.0"
     assert "RuntimeWarning" not in result.stderr
 
 

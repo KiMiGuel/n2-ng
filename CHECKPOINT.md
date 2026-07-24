@@ -12,12 +12,12 @@
 - [x] #7 restore managed mode (83bf884) on quit
 - [x] #8 archive originals (f3436da) after verified merge
 - [x] #6 usable at 800x480 (clamp_to_screen, adaptive geometry/minsize, HashcatDialog, pane minsizes; stale stop-attack test fixed)
-- [ ] Version bump 1.0.0 + CHANGELOG.md
+- [x] Version bump 1.0.0 + CHANGELOG.md
 - [ ] docs/THEORY.md
 - [ ] Final caged verification (py_compile + pytest + demo smoke)
 
 ## Current step
-Version bump 1.0.0 + CHANGELOG.md.
+docs/THEORY.md.
 
 ## Next
 #3, #9, #4, #7, #8, #6 in order; one commit per issue; no push.
