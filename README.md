@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/KiMiGuel/n2-ng/releases"><img src="https://img.shields.io/github/v/release/KiMiGuel/n2-ng?style=flat-square&color=%2300ff41&label=release" alt="Release"></a>
-  <img src="https://img.shields.io/badge/version-1.0.0-%2300ff41?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.1.0-%2300ff41?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square" alt="License">
   <img src="https://img.shields.io/badge/Kali-compatible-purple?style=flat-square" alt="Kali">
@@ -55,6 +55,8 @@ Built for **Kali Linux**. Tested on caffeine. Approved by anyone who's ever forg
 | Human-readable buttons ("Deauth" not `-0`) | ✅ | ❌ |
 | Live channel-hopping scan | ✅ | Manual `-C` flags |
 | Auto-handshake detection | ✅ | Wireshark eyeballing |
+| Handshake verification gate (messagepair: AUTHORIZED vs challenge-only) | ✅ (v1.1) | ❌ |
+| Auto .22000 hash extraction (capture/fix/merge/lazy) | ✅ (v1.1) | Manual `hcxpcapngtool` runs |
 | Real-time BSSID/PWR/Beacons/#Data/CH/MB/ENC/CIPHER/AUTH/ESSID | ✅ | `airodump-ng` output |
 | Sortable columns (PWR, Beacons, #Data) | ✅ | ❌ |
 | Right-click context menu (cap merge/fix) | ✅ | Manual `mergecap` |
@@ -103,6 +105,7 @@ All optional deps are checked at runtime — the tool warns you if something's m
 
 - [Install Guide](docs/INSTALL.md) — detailed installation & troubleshooting
 - [User Guide](docs/USER_GUIDE.md) — full feature walkthrough
+- [Features](docs/FEATURES.md) — v1.1 feature list & comparison vs raw aircrack-ng/hcxtools
 
 ---
 
