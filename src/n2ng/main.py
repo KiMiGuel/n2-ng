@@ -8,6 +8,7 @@ import argparse
 import os
 import platform
 import queue
+import random
 import re
 import shutil
 import shlex
@@ -614,6 +615,8 @@ class AirmonManager:
     def __init__(self):
         # Maps original interface -> detected monitor interface
         self._mon_map: dict[str, str] = {}
+        # Maps interface -> permanent MAC read from sysfs before randomization
+        self._orig_macs: dict[str, str] = {}
 
     @staticmethod
     def _list_interfaces() -> set[str]:
@@ -676,6 +679,42 @@ class AirmonManager:
         except Exception:
             return False
 
+    def randomize_mac(self, iface: str) -> str | None:
+        """Spoof a locally-administered random MAC, leaving the iface DOWN.
+
+        airmon-ng brings the interface up itself, and the monitor interface
+        inherits the spoofed MAC. Returns the new MAC, or None on failure.
+        """
+        try:
+            perm = Path(f"/sys/class/net/{iface}/address").read_text().strip()
+            if perm:
+                self._orig_macs[iface] = perm
+            first = (random.randrange(256) | 0x02) & 0xFE
+            new_mac = "%02x:%02x:%02x:%02x:%02x:%02x" % (
+                first,
+                *[random.randrange(256) for _ in range(5)],
+            )
+            subprocess.run(["ip", "link", "set", iface, "down"], check=True, capture_output=True)
+            subprocess.run(["ip", "link", "set", iface, "address", new_mac], check=True, capture_output=True)
+            return new_mac
+        except Exception as e:
+            print(f"warning: failed to randomize MAC on {iface}: {e}")
+            return None
+
+    def restore_mac(self, iface: str) -> str | None:
+        """Restore the stored permanent MAC (down -> set -> up), if any."""
+        perm = self._orig_macs.pop(iface, None)
+        if not perm:
+            return None
+        try:
+            subprocess.run(["ip", "link", "set", iface, "down"], check=True, capture_output=True)
+            subprocess.run(["ip", "link", "set", iface, "address", perm], check=True, capture_output=True)
+            subprocess.run(["ip", "link", "set", iface, "up"], check=True, capture_output=True)
+        except Exception as e:
+            print(f"warning: failed to restore MAC on {iface}: {e}")
+            return None
+        return perm
+
     def start_monitor(self, iface: str) -> str:
         # If the selected interface is already in monitor mode, use it directly.
         if self._is_monitor(iface):
@@ -733,6 +772,8 @@ class AirmonManager:
     def cleanup(self) -> None:
         for iface in list(self._mon_map.keys()):
             self.stop_monitor_for_iface(iface)
+        for iface in list(self._orig_macs.keys()):
+            self.restore_mac(iface)
 
     @staticmethod
     def _iface_exists(name: str) -> bool:
@@ -817,6 +858,7 @@ class Settings:
         "filter_encryption": "All",
         "quiet_mode": False,
         "auto_unlock_after_capture": False,
+        "mac_randomization": True,
         "col_visibility": {
             "pwr": True,
             "beacons": True,
@@ -1895,6 +1937,10 @@ class SettingsDialog(tk.Toplevel):
         self.auto_unlock_var = tk.BooleanVar(value=self.settings.get("auto_unlock_after_capture"))
         tk.Checkbutton(frame, text="Auto-unlock channel after capture", variable=self.auto_unlock_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=9, column=0, sticky=tk.W, columnspan=2)
 
+        # MAC randomization
+        self.mac_rand_var = tk.BooleanVar(value=self.settings.get("mac_randomization"))
+        tk.Checkbutton(frame, text="Randomize MAC before monitor mode", variable=self.mac_rand_var, bg=THEME["bg"], fg=THEME["fg"], selectcolor=THEME["panel"]).grid(row=10, column=0, sticky=tk.W, columnspan=2)
+
         # Buttons
         btn_frame = tk.Frame(self, bg=THEME["bg"])
         btn_frame.pack(pady=10)
@@ -1915,6 +1961,7 @@ class SettingsDialog(tk.Toplevel):
             "write_interval": self.interval_var.get(),
             "output_formats": formats,
             "auto_unlock_after_capture": self.auto_unlock_var.get(),
+            "mac_randomization": self.mac_rand_var.get(),
         }
         ok, error = self.apply_callback(proposed, self.pause_var.get())
         if ok:
@@ -1962,8 +2009,10 @@ class N2NgApp:
         self.clients: list[dict] = []
         self.locked_target: dict | None = None
         self.mon_iface: str | None = None
+        self._rand_iface: str | None = None
         self.current_band = tk.StringVar(value="Both")
         self.adapter_var = tk.StringVar()
+        self.mac_var = tk.StringVar(value="")
         self.poll_id = None
         self._poll_running = False
         self._capture_size_after_id = None
@@ -2187,6 +2236,7 @@ class N2NgApp:
         tk.Label(toolbar, text="Adapter:", bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
         self.adapter_combo = ttk.Combobox(toolbar, textvariable=self.adapter_var, state="readonly", width=16)
         self.adapter_combo.pack(side=tk.LEFT, padx=5)
+        tk.Label(toolbar, textvariable=self.mac_var, bg=THEME["panel"], fg=THEME["info"], font=self._mono_font).pack(side=tk.LEFT)
 
         tk.Label(toolbar, text="Band:", bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT, padx=5)
         self.band_combo = ttk.Combobox(
@@ -2503,6 +2553,22 @@ class N2NgApp:
         if ifaces and not self.adapter_var.get():
             self.adapter_var.set(ifaces[0])
 
+    def _update_mac_label(self):
+        mac = ""
+        if self.mon_iface:
+            try:
+                mac = Path(f"/sys/class/net/{self.mon_iface}/address").read_text().strip()
+            except Exception:
+                mac = ""
+        self.mac_var.set(mac)
+
+    def _restore_rand_mac(self):
+        if self._rand_iface:
+            perm = self.airmon.restore_mac(self._rand_iface)
+            if perm:
+                self._log(f"MAC restored to {perm}")
+            self._rand_iface = None
+
     def _start_monitor(self):
         iface = self.adapter_var.get()
         if not iface:
@@ -2510,18 +2576,28 @@ class N2NgApp:
             return
         self._log(f"Starting monitor mode on {iface}")
         try:
+            self._rand_iface = None
+            if self.settings.get("mac_randomization") and not self.airmon._is_monitor(iface):
+                new_mac = self.airmon.randomize_mac(iface)
+                if new_mac:
+                    self._rand_iface = iface
+                    self._log(f"MAC randomized to {new_mac} on {iface}")
             self.mon_iface = self.airmon.start_monitor(iface)
             self.status.config(text=f"Monitor: {self.mon_iface}")
+            self._update_mac_label()
             ok, error = self.worker.start_scan(self.mon_iface, self.current_band.get(), scan_prefix())
             if not ok:
                 failed_iface = self.mon_iface
                 self.mon_iface = None
                 self.airmon.stop_monitor(failed_iface)
+                self._restore_rand_mac()
+                self._update_mac_label()
                 self.pause_btn.config(text="Pause Scan", state=tk.DISABLED, width=10)
                 self.status.config(text=f"Scan failed: {error}", bg="red", fg="white")
                 return
             self.pause_btn.config(text="Pause Scan", state=tk.NORMAL)
         except Exception as e:
+            self._restore_rand_mac()
             messagebox.showerror("N2-ng", f"Failed to start monitor mode: {e}")
 
     def _stop_monitor(self):
@@ -2530,6 +2606,8 @@ class N2NgApp:
         if self.mon_iface:
             self.airmon.stop_monitor(self.mon_iface)
             self.mon_iface = None
+        self._restore_rand_mac()
+        self._update_mac_label()
         self.status.config(text="Monitor stopped")
         self.channel_pill.config(text="SCANNING ALL", bg="red")
         self.pause_btn.config(text="Pause Scan", state=tk.DISABLED, width=10)
