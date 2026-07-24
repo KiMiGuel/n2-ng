@@ -6,7 +6,7 @@
 ## Status
 - [x] Setup: branch created, tree clean
 - [x] #5 Stop Attack orphans processes (1583f33)
-- [ ] #3 WEP "cannot determine our mac address"
+- [x] #3 WEP (b915ae2) "cannot determine our mac address"
 - [ ] #9 mouse wheel in side windows
 - [ ] #4 MAC randomization before Start Monitor
 - [ ] #7 restore managed mode on quit
@@ -17,7 +17,7 @@
 - [ ] Final caged verification (py_compile + pytest + demo smoke)
 
 ## Current step
-Implementing #3.
+Implementing #9.
 
 ## Next
 #3, #9, #4, #7, #8, #6 in order; one commit per issue; no push.
