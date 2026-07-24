@@ -497,6 +497,35 @@ class DependencyChecker:
         return statuses
 
 
+def bind_mousewheel(widget, target):
+    """Bind mouse wheel events on `widget` and its children to scroll `target`."""
+    def _on_mousewheel(event):
+        # Windows sends +/-120 per notch; macOS sends small deltas, so fall back to sign.
+        steps = -1 * (event.delta // 120) if event.delta else 0
+        if steps == 0 and event.delta:
+            steps = -1 if event.delta > 0 else 1
+        if steps:
+            target.yview_scroll(steps, "units")
+        return "break"
+
+    def _on_button4(_event):
+        target.yview_scroll(-1, "units")
+        return "break"
+
+    def _on_button5(_event):
+        target.yview_scroll(1, "units")
+        return "break"
+
+    def _bind(w):
+        w.bind("<MouseWheel>", _on_mousewheel)
+        w.bind("<Button-4>", _on_button4)
+        w.bind("<Button-5>", _on_button5)
+        for child in w.winfo_children():
+            _bind(child)
+
+    _bind(widget)
+
+
 class DependencySplash(tk.Toplevel):
     """Startup dependency report shown before the main window."""
 
@@ -524,6 +553,7 @@ class DependencySplash(tk.Toplevel):
         self.hint.pack(anchor=tk.W, padx=12, pady=(0, 12))
         self.bind_all("<Button-1>", self._maybe_close, add="+")
         self._checks_done = False
+        bind_mousewheel(self, self.text)
 
     def run(self) -> bool:
         self.grab_set()
@@ -1486,6 +1516,7 @@ class ConversionDialog(tk.Toplevel):
         buttons.pack(fill=tk.X, padx=10, pady=(0, 10))
         tk.Button(buttons, text="Convert", command=self._convert, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.LEFT)
         tk.Button(buttons, text="Cancel", command=self.destroy, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.RIGHT)
+        bind_mousewheel(self, self.status)
 
     def _preview_text(self) -> str:
         if self.mode.get() == "pcapng":
@@ -1558,6 +1589,7 @@ class HashcatDialog(tk.Toplevel):
         tk.Button(buttons, text="Close", command=self.destroy, bg=THEME["panel"], fg=THEME["fg"]).pack(side=tk.RIGHT)
         self.wordlist_var.trace_add("write", lambda *_args: self._update_preview())
         self._update_preview()
+        bind_mousewheel(self, self.output)
 
     def _browse_wordlist(self):
         path = filedialog.askopenfilename(parent=self, title="Select wordlist")
@@ -2541,6 +2573,7 @@ class N2NgApp:
         self.wps_scanner = WpsScanner(self.mon_iface, self._on_wps_event)
         self.wps_scanner.start()
         tk.Button(self.wps_dialog, text="Stop", command=self._stop_wps_scan, bg=THEME["panel"], fg=THEME["fg"]).pack(pady=5)
+        bind_mousewheel(self.wps_dialog, text)
 
     def _on_wps_event(self, event, payload):
         self.queue.put(("wps_line" if event == "wps_line" else "error", payload))
