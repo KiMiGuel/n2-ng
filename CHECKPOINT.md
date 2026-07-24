@@ -13,11 +13,11 @@
 - [x] #8 archive originals (f3436da) after verified merge
 - [x] #6 usable at 800x480 (clamp_to_screen, adaptive geometry/minsize, HashcatDialog, pane minsizes; stale stop-attack test fixed)
 - [x] Version bump 1.0.0 + CHANGELOG.md
-- [ ] docs/THEORY.md
+- [x] docs/THEORY.md
 - [ ] Final caged verification (py_compile + pytest + demo smoke)
 
 ## Current step
-docs/THEORY.md.
+Final caged verification, then done.
 
 ## Next
 #3, #9, #4, #7, #8, #6 in order; one commit per issue; no push.
