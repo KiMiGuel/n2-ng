@@ -10,14 +10,14 @@
 - [x] #9 mouse wheel (0e2d7b7) in side windows
 - [x] #4 MAC randomization (d287423) before Start Monitor
 - [x] #7 restore managed mode (83bf884) on quit
-- [ ] #8 archive originals after verified merge
+- [x] #8 archive originals (f3436da) after verified merge
 - [ ] #6 usable at 800x480
 - [ ] Version bump 1.0.0 + CHANGELOG.md
 - [ ] docs/THEORY.md
 - [ ] Final caged verification (py_compile + pytest + demo smoke)
 
 ## Current step
-Implementing #8.
+Implementing #6.
 
 ## Next
 #3, #9, #4, #7, #8, #6 in order; one commit per issue; no push.
