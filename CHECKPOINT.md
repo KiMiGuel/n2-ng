@@ -14,10 +14,10 @@
 - [x] #6 usable at 800x480 (clamp_to_screen, adaptive geometry/minsize, HashcatDialog, pane minsizes; stale stop-attack test fixed)
 - [x] Version bump 1.0.0 + CHANGELOG.md
 - [x] docs/THEORY.md
-- [ ] Final caged verification (py_compile + pytest + demo smoke)
+- [x] Final caged verification (py_compile + pytest + demo smoke)
 
 ## Current step
-Final caged verification, then done.
+All release items complete. 78/78 tests pass; demo smoke on 800x480 Xvfb screen: geometry 800x480, minsize 760x420.
 
 ## Next
 #3, #9, #4, #7, #8, #6 in order; one commit per issue; no push.
