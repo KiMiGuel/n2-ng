@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.2
+
+### Fixed
+- OMNI Attack button did nothing when clicked without first running a manual WPS scan: `self.wps_lines` was only ever initialized inside the separate WPS Scan handler, so `_omni_attack()` raised an uncaught `AttributeError` inside the button's Tk callback — Tkinter swallows callback exceptions to stderr with no dialog, so the button appeared to do nothing. Now initialized in `N2NgApp.__init__`.
+- OMNI's WPS and ONLINE stages (reaver/wacker) had no root check, unlike `AttackController` (v1.7.1) — running without root silently burned through retries with misleading "AP rate limiting" pacing before failing with no real diagnosis. Both stages now fail fast with a clear "not root" message; `_default_run_cmd`'s own root-check message was also reworded to avoid colliding with the lockout-detection regex.
+- `_omni_attack()`'s setup (target dir creation, orchestrator construction) is now wrapped in try/except so any future failure there surfaces as a logged error + dialog instead of silently vanishing into a swallowed Tk callback exception.
+
 ## 1.7.1
 
 ### Fixed

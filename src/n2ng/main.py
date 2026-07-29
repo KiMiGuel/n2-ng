@@ -28,7 +28,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 try:
     from . import __version__
 except ImportError:
-    __version__ = "1.7.1"
+    __version__ = "1.7.2"
 
 
 THEME = {
@@ -2512,6 +2512,7 @@ class N2NgApp:
         self._pmkid_attacker: PmkidAttacker | None = None
         self._smart_worker: SmartAttackOrchestrator | None = None
         self._omni_worker = None
+        self.wps_lines: list[str] = []
 
         self.networks: dict[str, dict] = {}
         self._networks_prev: dict[str, dict] = {}
@@ -3716,37 +3717,43 @@ class N2NgApp:
             from .omni import OmniAttackOrchestrator
         except ImportError:
             from omni import OmniAttackOrchestrator
-        target_dir = capture_root() / sanitize_essid(essid, bssid)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        profile = security_profile(self.locked_target)
-        wordlist = default_hashcat_wordlist()
-        default_rules = Path("/usr/share/hashcat/rules/best64.rule")
-        rules = default_rules if default_rules.exists() else None
-        session = f"omni-{int(time.time())}"
-        if wordlist is not None:
-            build_crack_cmd = lambda batch: build_hashcat_command(
-                batch, wordlist, session=session, rules=rules, nonce_error_corrections=64
+        try:
+            target_dir = capture_root() / sanitize_essid(essid, bssid)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            profile = security_profile(self.locked_target)
+            wordlist = default_hashcat_wordlist()
+            default_rules = Path("/usr/share/hashcat/rules/best64.rule")
+            rules = default_rules if default_rules.exists() else None
+            session = f"omni-{int(time.time())}"
+            if wordlist is not None:
+                build_crack_cmd = lambda batch: build_hashcat_command(
+                    batch, wordlist, session=session, rules=rules, nonce_error_corrections=64
+                )
+            else:
+                build_crack_cmd = None
+            log_via_queue = lambda msg: self.queue.put(("log", msg))
+            pmkid_factory = lambda: PmkidAttacker(
+                bssid, essid, self.mon_iface, sta_mac, pmkid_output_path(essid, bssid),
+                log_via_queue, event_queue=self.queue, attempts=3, timeout=10,
             )
-        else:
-            build_crack_cmd = None
-        log_via_queue = lambda msg: self.queue.put(("log", msg))
-        pmkid_factory = lambda: PmkidAttacker(
-            bssid, essid, self.mon_iface, sta_mac, pmkid_output_path(essid, bssid),
-            log_via_queue, event_queue=self.queue, attempts=3, timeout=10,
-        )
-        self._omni_worker = OmniAttackOrchestrator(
-            self.locked_target, profile, self.mon_iface, sta_mac,
-            self.attack, self.capture_manager, log_via_queue,
-            event_queue=self.queue,
-            pmkid_factory=pmkid_factory,
-            target_dir=target_dir,
-            build_crack_cmd=build_crack_cmd,
-            wps_lines=list(self.wps_lines),
-            wordlist=wordlist,
-            crack_rules=rules,
-            clients=self._target_client_macs(bssid),
-        )
-        self._omni_worker.start()
+            self._omni_worker = OmniAttackOrchestrator(
+                self.locked_target, profile, self.mon_iface, sta_mac,
+                self.attack, self.capture_manager, log_via_queue,
+                event_queue=self.queue,
+                pmkid_factory=pmkid_factory,
+                target_dir=target_dir,
+                build_crack_cmd=build_crack_cmd,
+                wps_lines=list(self.wps_lines),
+                wordlist=wordlist,
+                crack_rules=rules,
+                clients=self._target_client_macs(bssid),
+            )
+            self._omni_worker.start()
+        except Exception as exc:
+            self._omni_worker = None
+            self._log(f"OMNI Attack failed to start: {exc!r}")
+            messagebox.showerror("N2-ng", f"OMNI Attack failed to start:\n{exc}")
+            return
         self._log(f"OMNI Attack started on {essid} ({bssid})")
 
     def _stop_attack(self):

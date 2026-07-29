@@ -47,8 +47,18 @@ def wps_state(bssid: str, wps_lines: list[str] | None) -> str:
     return "unknown"
 
 
-def _default_run_cmd(stop_event: threading.Event, cmd: list[str], timeout: int | None) -> tuple[int, str]:
+def _default_run_cmd(
+    stop_event: threading.Event, cmd: list[str], timeout: int | None, log_func=None
+) -> tuple[int, str]:
     """Run cmd in its own process group; kill on stop event or timeout."""
+    if os.geteuid() != 0:
+        # Wording deliberately avoids "locked"/"lockout" substrings — WPS_LOCKOUT_RE
+        # scans this same string via the (rc, out) return value, and a message
+        # containing e.g. "blocked" would be misread as an AP rate-limit lockout.
+        msg = f"n2-ng: refusing to run '{cmd[0]}' — not root (relaunch with: sudo n2-ng)"
+        if log_func:
+            log_func(msg)
+        return 1, msg
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace", start_new_session=True,
@@ -135,7 +145,8 @@ class OmniAttackOrchestrator(threading.Thread):
         self.pmkid_factory = pmkid_factory
         self.target_dir = target_dir
         self.build_crack_cmd = build_crack_cmd
-        self._run_cmd = run_cmd or (lambda cmd, timeout: _default_run_cmd(self._stop, cmd, timeout))
+        self._run_cmd = run_cmd or (lambda cmd, timeout: _default_run_cmd(self._stop, cmd, timeout, self.log))
+        self._is_root = os.geteuid() == 0
         self.wps_lines = list(wps_lines or [])
         self.wordlist = wordlist
         self.crack_rules = crack_rules
@@ -235,6 +246,9 @@ class OmniAttackOrchestrator(threading.Thread):
         return ok
 
     def _stage_wps(self, wps: str) -> bool:
+        if not self._is_root:
+            self._record("WPS", "FAIL", 0.0, "not root — reaver needs raw-socket access (relaunch with: sudo n2-ng)")
+            return False
         bssid = self.net["bssid"]
         channel = str(self.net.get("channel", ""))
         lockouts = 0
@@ -299,6 +313,9 @@ class OmniAttackOrchestrator(threading.Thread):
 
     def _stage_online(self, wps: str) -> bool:
         t0 = time.monotonic()
+        if not self._is_root:
+            self._record("ONLINE", "FAIL", 0.0, "not root — reaver/wacker need raw-socket access (relaunch with: sudo n2-ng)")
+            return False
         bssid = self.net["bssid"]
         channel = str(self.net.get("channel", ""))
         if wps == "enabled":
