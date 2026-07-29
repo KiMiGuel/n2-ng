@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.1
+
+### Fixed
+- `AttackController` never checked for root; `aireplay-ng`/`reaver` need raw-socket access and died silently (<1ms, invisible in `ps aux`) when n2-ng was launched without `sudo`, so OMNI's HANDSHAKE stage produced junk captures with no EAPOL M3. Now logs a loud warning at init and refuses to spawn with a clear message instead of a silent per-attack failure.
+
 ## 1.7.0
 
 ### Added

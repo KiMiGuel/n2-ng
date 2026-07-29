@@ -28,7 +28,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 try:
     from . import __version__
 except ImportError:
-    __version__ = "1.7.0"
+    __version__ = "1.7.1"
 
 
 THEME = {
