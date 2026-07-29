@@ -1420,8 +1420,15 @@ class AttackController:
         self._current = None
         self._procs = set()
         self._lock = threading.Lock()
+        self._is_root = os.geteuid() == 0
+        if not self._is_root:
+            self.log("WARNING: n2-ng is not running as root — aireplay-ng/reaver require raw-socket "
+                      "access and will fail silently on every attack. Relaunch with: sudo n2-ng")
 
     def _run(self, cmd: list[str]):
+        if not self._is_root:
+            self.log(f"Attack blocked: not root, refusing to run '{cmd[0]}' (relaunch with: sudo n2-ng)")
+            return
         self.log(f"$ {' '.join(cmd)}")
         proc = None
         try:
