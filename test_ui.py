@@ -177,6 +177,7 @@ def test_target_selection_locks_channel(monkeypatch, tmp_path):
     app = _n2ng.N2NgApp(root)
     app.mon_iface = "wlan0mon"
     monkeypatch.setattr(_n2ng.subprocess, "run", lambda *a, **kw: types.SimpleNamespace(returncode=0))
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
     app.worker.start_lock = Mock(return_value=(True, None))
     bssid = "AA:BB:CC:DD:EE:FF"
     app.networks[bssid] = {
@@ -210,6 +211,7 @@ def test_unlock_button_resumes_channel_scan(monkeypatch, tmp_path):
     app = _n2ng.N2NgApp(root)
     app.mon_iface = "wlan0mon"
     monkeypatch.setattr(_n2ng.subprocess, "run", lambda *a, **kw: types.SimpleNamespace(returncode=0))
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
     app.worker.start_lock = Mock(return_value=(True, None))
     app.worker.start_scan = Mock(return_value=(True, None))
     bssid = "AA:BB:CC:DD:EE:FF"
@@ -1039,4 +1041,66 @@ def test_channel_sort_ties_break_by_power_descending():
     ordered = [net["bssid"] for net in app._sort_networks(networks)]
 
     assert ordered == ["AA:00:00:00:00:03", "AA:00:00:00:00:02", "AA:00:00:00:00:01"]
+    root.destroy()
+
+
+def _seed_network(app, bssid="AA:BB:CC:DD:EE:FF", essid="Net", channel="6"):
+    app.networks[bssid] = {
+        "bssid": bssid, "essid": essid, "power": "-50", "beacons": "10",
+        "iv": "0", "channel": channel, "speed": "54", "privacy": "WPA2",
+        "cipher": "CCMP", "auth": "PSK", "manufacturer": "Vendor",
+    }
+    app._refresh_tree()
+
+
+def test_lock_channel_with_target_captures_into_target_folder(monkeypatch, tmp_path):
+    """Single-click channel lock must capture into the target folder (with
+    CaptureManager polling), not into scan/ where handshakes are lost."""
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.mon_iface = "wlan0mon"
+    monkeypatch.setattr(_n2ng.subprocess, "run", lambda *a, **kw: types.SimpleNamespace(returncode=0))
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
+    app.worker.start_lock = Mock(return_value=(True, None))
+    bssid = "AA:BB:CC:DD:EE:FF"
+    _seed_network(app, bssid)
+
+    app.tree.selection_set(bssid)
+    app._on_network_select()
+
+    args = app.worker.start_lock.call_args[0]
+    assert "Net_AA-BB-CC-DD-EE-FF" in args[3]
+    assert "scan" not in Path(args[3]).parent.name
+    assert app.capture_manager.active_cap is not None
+    assert "Net_AA-BB-CC-DD-EE-FF" in str(app.capture_manager.active_cap)
+    root.destroy()
+
+
+def test_lock_target_tracks_actual_airodump_cap_suffix(monkeypatch, tmp_path):
+    """If airodump lands on a higher -NN suffix, CaptureManager must poll that
+    file, not a hardcoded -01."""
+    root = tk.Tk()
+    root.withdraw()
+    app = _n2ng.N2NgApp(root)
+    app.mon_iface = "wlan0mon"
+    monkeypatch.setattr(_n2ng.subprocess, "run", lambda *a, **kw: types.SimpleNamespace(returncode=0))
+    monkeypatch.setattr(_n2ng, "capture_root", lambda create=True: tmp_path)
+    bssid = "AA:BB:CC:DD:EE:FF"
+    _seed_network(app, bssid)
+    prefix = tmp_path / "Net_AA-BB-CC-DD-EE-FF" / "capture_2030-01-01_00-00-00"
+    prefix.parent.mkdir(parents=True)
+    # airodump bumped past -01 because a stale file existed at spawn time.
+    Path(f"{prefix}_lock-01.cap").write_bytes(b"stale")
+    Path(f"{prefix}_lock-02.cap").write_bytes(b"live")
+
+    def fake_start_lock(iface, ch, b, p):
+        return True, None
+
+    app.worker.start_lock = Mock(side_effect=fake_start_lock)
+    monkeypatch.setattr(_n2ng, "target_capture_prefix", lambda essid, b, now=None: str(prefix))
+
+    app._lock_target(bssid)
+
+    assert str(app.capture_manager.active_cap).endswith("_lock-02.cap")
     root.destroy()

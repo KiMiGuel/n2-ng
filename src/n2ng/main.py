@@ -538,6 +538,42 @@ def numbered_airodump_csv_paths(prefix: str) -> list[Path]:
     return [path for path in parent.glob(f"{prefix_path.name}-*.csv") if numbered_csv.match(path.name)]
 
 
+def numbered_airodump_output_paths(prefix: str) -> list[Path]:
+    """Every airodump-ng output file for a -w prefix (any -NN suffix/type)."""
+    prefix_path = Path(prefix)
+    stem = re.escape(prefix_path.name)
+    numbered = re.compile(rf"^{stem}-\d+\..+$")
+    return [path for path in prefix_path.parent.glob(f"{prefix_path.name}-*.*") if numbered.match(path.name)]
+
+
+def clear_airodump_outputs(prefix: str) -> None:
+    """Delete prior airodump-ng outputs so a fresh run restarts at -01.
+
+    airodump-ng never overwrites an existing prefix-NN file — it bumps to the
+    next number. Leftover files desync callers that expect -01 (CaptureManager
+    would poll a dead cap and never see the live handshake).
+    """
+    for path in numbered_airodump_output_paths(prefix):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def latest_airodump_cap_path(prefix: str) -> Path | None:
+    """Highest-numbered .cap for a -w prefix, or None if airodump wrote none."""
+    prefix_path = Path(prefix)
+    stem = re.escape(prefix_path.name)
+    numbered_cap = re.compile(rf"^{stem}-(\d+)\.cap$")
+    best = None
+    best_num = -1
+    for path in prefix_path.parent.glob(f"{prefix_path.name}-*.cap"):
+        match = numbered_cap.match(path.name)
+        if match and int(match.group(1)) > best_num:
+            best, best_num = path, int(match.group(1))
+    return best
+
+
 class DependencyChecker:
     REQUIRED_TOOLS = {
         "airmon-ng": {"cmd": "airmon-ng", "apt": "sudo apt install -y aircrack-ng"},
@@ -1180,11 +1216,10 @@ class AirodumpWorker(threading.Thread):
     def _launch(self, cmd: list[str]) -> tuple[bool, str | None]:
         self._stop_process()
         self._last_cmd = cmd
-        for csv_path in numbered_airodump_csv_paths(self._prefix):
-            try:
-                csv_path.unlink()
-            except OSError:
-                pass
+        # Clear ALL prior outputs (caps included): airodump-ng bumps the -NN
+        # suffix instead of overwriting, so stale caps would desync callers
+        # that poll for the fresh capture.
+        clear_airodump_outputs(self._prefix)
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -1708,7 +1743,10 @@ class SmartAttackOrchestrator(threading.Thread):
             if self.capture_manager.handshake_found or self.capture_manager.pmkid_found:
                 self.log("Smart Attack: capture obtained, stopping deauth loop.")
                 return
-            self.attack.deauth_all(bssid, self.mon_iface, count=5, clients=self.clients)
+            # count=1: aireplay-ng sends 64 deauth frames per count unit, so a
+            # single count is already a full kick burst. Larger counts flood
+            # the airtime and clients back off without re-handshaking.
+            self.attack.deauth_all(bssid, self.mon_iface, count=1, clients=self.clients)
             if not self._sleep(self.interval):
                 self.log("Smart Attack stopped.")
                 return
@@ -2527,6 +2565,7 @@ class N2NgApp:
         self._poll_running = False
         self._capture_size_after_id = None
         self._poll_capture_after_id = None
+        self._auto_deauth_after_id = None
         self._last_network_signature = None
         self._last_client_signature = None
         self._cleanup_done = False
@@ -3329,9 +3368,11 @@ class N2NgApp:
                 messagebox.showwarning("N2-ng", "Lock a target first.")
                 self.auto_deauth_var.set(False)
                 return
+            self._cancel_after("_auto_deauth_after_id")  # never stack chains
             self._log("Auto-deauth loop started")
             self._auto_deauth_tick()
         else:
+            self._cancel_after("_auto_deauth_after_id")
             self._log("Auto-deauth loop stopped")
 
     def _auto_deauth_tick(self):
@@ -3344,9 +3385,11 @@ class N2NgApp:
                 self._unlock_channel()
             return
         bssid = self.locked_target["bssid"]
-        self.attack.deauth_all(bssid, self.mon_iface, count=5, clients=self._target_client_macs(bssid))
+        # count=1: aireplay-ng sends 64 deauth frames per count unit — one
+        # count is already a full kick burst; more just floods the airtime.
+        self.attack.deauth_all(bssid, self.mon_iface, count=1, clients=self._target_client_macs(bssid))
         interval = int(self.deauth_interval_var.get()) * 1000
-        self.root.after(interval, self._auto_deauth_tick)
+        self._auto_deauth_after_id = self.root.after(interval, self._auto_deauth_tick)
 
     def _target_client_macs(self, bssid: str) -> list[str]:
         """Stations associated with bssid from the parsed airodump CSV."""
@@ -3408,18 +3451,40 @@ class N2NgApp:
         subprocess.run(["iw", "dev", self.mon_iface, "set", "channel", str(ch)], capture_output=True)
 
         # Restart airodump-ng in lock mode. This is what actually stops hopping.
-        ok, error = self.worker.start_lock(self.mon_iface, ch, bssid, scan_prefix())
+        # With a locked target the capture belongs in the target folder (and
+        # under CaptureManager polling) — not in scan/, where handshakes used
+        # to land untracked.
+        if self.locked_target:
+            prefix = target_capture_prefix(self.locked_target["essid"], bssid)
+        else:
+            prefix = scan_prefix()
+        ok, error = self.worker.start_lock(self.mon_iface, ch, bssid, prefix)
         if not ok:
             self.channel_locked = False
             self.locked_channel = None
             self.status.config(text=f"Channel lock failed: {error}", bg="red", fg="white")
             return
 
+        if self.locked_target:
+            self.capture_manager.set_active_cap(self._resolve_lock_cap(prefix))
+            self._poll_capture()
+            self._start_capture_size_monitor()
+
         self.pause_btn.config(text="Pause Scan", state=tk.NORMAL)
         self.unlock_btn.config(state=tk.NORMAL)
         self.channel_pill.config(text=f"🔒 Locked to CH {ch}", bg="green")
         self.status.config(text=f"🔒 Locked to CH {ch}", bg=THEME["panel"], fg=THEME["fg"])
         self._log(f"Locked channel {ch} for {self.locked_target['essid']} ({bssid})")
+
+    @staticmethod
+    def _resolve_lock_cap(prefix: str) -> Path:
+        """Cap file airodump-ng actually wrote for a lock prefix.
+
+        Normally prefix_lock-01.cap, but airodump bumps the suffix if a stale
+        file existed at spawn time — poll the live one, never a hardcoded -01.
+        """
+        lock_prefix = prefix if prefix.endswith("_lock") else f"{prefix}_lock"
+        return latest_airodump_cap_path(lock_prefix) or Path(f"{lock_prefix}-01.cap")
 
     def _unlock_channel(self):
         """Resume channel hopping."""
@@ -3528,7 +3593,7 @@ class N2NgApp:
             self.pause_btn.config(text="Pause Scan", state=tk.DISABLED, width=10)
             return
         self.pause_btn.config(text="Pause Scan", state=tk.NORMAL)
-        self.capture_manager.set_active_cap(Path(f"{prefix}_lock-01.cap"))
+        self.capture_manager.set_active_cap(self._resolve_lock_cap(prefix))
         self._poll_capture()
         self.channel_pill.config(text=f"LOCKED: CH {ch}", bg="green")
         self._update_target_card(net)

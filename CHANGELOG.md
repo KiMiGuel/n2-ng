@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.3
+
+### Fixed
+- Junk/empty captures and deauth floods with no handshake — root cause: airodump-ng never overwrites an existing `prefix-NN.cap`, it bumps the suffix, but `AirodumpWorker._launch` only deleted stale `.csv` files before each (re)start. Caps accumulated (`n2ng_scan_lock-168.cap`, 24-byte header-only caps from rapid restarts) while `_lock_target` hardcoded `set_active_cap(prefix_lock-01.cap)`, so CaptureManager polled a dead file, `handshake_found` never fired, and auto-deauth/Smart Attack/OMNI loops never stopped — the resulting deauth flood kept clients from ever completing a 4-way handshake. `_launch` now clears every prior airodump output via `clear_airodump_outputs()` so each run restarts at `-01`, and both lock paths resolve the cap airodump actually wrote via `latest_airodump_cap_path()`.
+- Handshakes landing in `scan/` instead of the target folder: single-click target selection (`_select_target` → `_lock_channel`) restarted capture into `scan_prefix()` even with a target locked, bypassing CaptureManager polling. `_lock_channel` now captures into the target folder (`target_capture_prefix`) with polling/size monitoring whenever a target is locked.
+- Auto-deauth loop could stack multiple `after()` chains when toggled repeatedly; the pending timer is now tracked and cancelled on toggle-off/re-toggle.
+- Deauth flood defeated the handshake capture: `aireplay-ng -0 N` sends **64 frames per count unit**, so automated loops with `count=5` burst 320 deauths every 10s — clients backed off for minutes instead of re-handshaking (verified live against a test AP: handshake only completed ~2 min after the storm ended). Automated loops (auto-deauth, Smart Attack, OMNI) now use `count=1` (one 64-frame kick burst), and OMNI's handshake interval is 15s to leave the client clean airtime to re-handshake.
+
 ## 1.7.2
 
 ### Fixed

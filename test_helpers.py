@@ -718,7 +718,7 @@ def test_smart_attack_wpa2_deauths_until_handshake(monkeypatch):
     orchestrator.run()
 
     attack.deauth_all.assert_called_once_with(
-        "AA:BB:CC:DD:EE:FF", "wlan0mon", count=5, clients=["22:33:44:55:66:77"]
+        "AA:BB:CC:DD:EE:FF", "wlan0mon", count=1, clients=["22:33:44:55:66:77"]
     )
 
 
@@ -860,3 +860,51 @@ def test_wps_state_parsing():
     assert wps_state("AA:BB:CC:DD:EE:FF", ["AA:BB:CC:DD:EE:FF  6  -45  2.0  No   V  Net"]) == "enabled"
     assert wps_state("AA:BB:CC:DD:EE:FF", []) == "unknown"
     assert wps_state("AA:BB:CC:DD:EE:FF", ["garbage line"]) == "unknown"
+
+
+def test_clear_airodump_outputs_removes_caps_and_csvs(tmp_path):
+    prefix = tmp_path / "n2ng_scan_lock"
+    for name in (
+        "n2ng_scan_lock-01.cap", "n2ng_scan_lock-02.cap",
+        "n2ng_scan_lock-01.csv", "n2ng_scan_lock-01.kismet.csv",
+        "n2ng_scan_lock-01.netxml",
+    ):
+        (tmp_path / name).write_text("stale")
+    (tmp_path / "other-01.cap").write_text("keep")
+
+    _n2ng.clear_airodump_outputs(str(prefix))
+
+    assert list(tmp_path.iterdir()) == [tmp_path / "other-01.cap"]
+
+
+def test_launch_clears_prior_caps_so_suffix_restarts_at_01(monkeypatch, tmp_path):
+    """airodump-ng never overwrites prefix-NN files: stale caps must be
+    deleted before spawn or the new run lands on a higher suffix and
+    CaptureManager polls a dead file forever."""
+    settings = _n2ng.Settings()
+    worker = _n2ng.AirodumpWorker(_n2ng.queue.Queue(), settings)
+    prefix = tmp_path / "n2ng_scan"
+    (tmp_path / "n2ng_scan-07.cap").write_text("stale")
+    (tmp_path / "n2ng_scan-07.csv").write_text("stale")
+    proc = Mock()
+    proc.stdout = iter([])
+    proc.poll.return_value = None
+    monkeypatch.setattr(_n2ng.subprocess, "Popen", lambda *a, **kw: proc)
+    monkeypatch.setattr(_n2ng.AirodumpWorker, "_ensure_poll_thread", lambda self: None)
+
+    ok, _ = worker.start_scan("wlan0mon", "Both", str(prefix))
+
+    assert ok
+    assert not (tmp_path / "n2ng_scan-07.cap").exists()
+    assert not (tmp_path / "n2ng_scan-07.csv").exists()
+
+
+def test_latest_airodump_cap_path_picks_highest_suffix(tmp_path):
+    prefix = tmp_path / "cap"
+    (tmp_path / "cap-01.cap").write_text("a")
+    (tmp_path / "cap-12.cap").write_text("b")
+    (tmp_path / "cap-02.cap").write_text("c")
+    (tmp_path / "cap-12.csv").write_text("ignore")
+
+    assert _n2ng.latest_airodump_cap_path(str(prefix)) == tmp_path / "cap-12.cap"
+    assert _n2ng.latest_airodump_cap_path(str(tmp_path / "missing")) is None
